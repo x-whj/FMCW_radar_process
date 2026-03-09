@@ -21,3 +21,8 @@
 *.lib
 *.dll
 *.exe
+
+# MATLAB temp/output
+*.asv
+*.mlx~
+matlab/data/
