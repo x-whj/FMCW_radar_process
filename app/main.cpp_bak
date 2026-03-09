@@ -1,0 +1,127 @@
+#include <array>
+#include <csignal>
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <atomic>
+
+#include <cuda_runtime.h>
+
+#include "ChebWindow256.h"
+#include "gpu/RadarPipeline.h"
+#include "io/RingBuffer.h"
+#include "io/UdpReceiver.h"
+#include "model/Calibration.h"
+#include "model/ChannelMap.h"
+#include "model/RadarConfig.h"
+#include "runtime/Logger.h"
+#include "runtime/Metrics.h"
+
+namespace
+{
+    std::atomic<bool> g_running{true};
+    void on_sigint(int)
+    {
+        g_running = false;
+    }
+}
+
+int main()
+{
+    using namespace radar;
+
+    std::signal(SIGINT, on_sigint);
+
+    RadarConfig cfg;
+    ChannelMap chmap;
+    chmap.sum_primary = 0;
+    chmap.diff_az = 1;
+    chmap.diff_el = 2;
+    chmap.has_diff_az = true;
+    chmap.has_diff_el = true;
+    MonopulseCalibration calib;
+    RuntimeMetrics metrics;
+
+    try
+    {
+        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
+
+        constexpr std::size_t kSlots = 3;
+        std::array<RxFrameSlot, kSlots> slots{};
+        for (auto &s : slots)
+        {
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void **>(&s.mapped_host),
+                                     cfg.frame_payload_bytes(),
+                                     cudaHostAllocMapped));
+            CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&s.mapped_dev),
+                                                s.mapped_host,
+                                                0));
+        }
+
+        FixedSlotRing<RxFrameSlot, kSlots> ring;
+        UdpReceiver<kSlots> receiver(cfg, metrics, ring, slots);
+        if (!receiver.start())
+        {
+            Logger::error("failed to start UDP receiver");
+            return 1;
+        }
+
+        RadarPipeline pipeline(cfg, chmap, calib);
+        pipeline.initialize(CHEB_WINDOW_256);
+
+        Logger::info("Radar pipeline initialized. Waiting for frames...");
+
+        while (g_running)
+        {
+            auto ready = ring.wait_and_acquire_ready();
+            if (!ready.has_value())
+                break;
+
+            auto &slot = slots[*ready];
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+
+            std::vector<RadarTarget> targets;
+            int count = pipeline.process_frame(slot.mapped_dev, targets);
+
+            metrics.gpu_frames_processed.fetch_add(1, std::memory_order_relaxed);
+            metrics.gpu_targets_reported.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+
+            std::cout << "[Frame " << slot.frame_id << "] targets=" << count << std::endl;
+            for (int i = 0; i < count; ++i)
+            {
+                const auto &t = targets[i];
+                std::cout << "  idx=" << i
+                          << " range=" << t.range_m << " m"
+                          << " vel=" << t.velocity_mps << " m/s"
+                          << " az=" << t.azimuth_deg << " deg"
+                          << " el=" << t.elevation_deg << " deg"
+                          << " snr=" << t.snr_db << " dB"
+                          << std::endl;
+            }
+
+            ring.release(*ready);
+        }
+
+        receiver.stop();
+        ring.shutdown();
+
+        for (auto &s : slots)
+        {
+            if (s.mapped_host)
+            {
+                cudaFreeHost(s.mapped_host);
+                s.mapped_host = nullptr;
+                s.mapped_dev = nullptr;
+            }
+        }
+
+        Logger::info("shutdown complete");
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Fatal: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
