@@ -1,42 +1,42 @@
-# FMCW Radar GPU Pipeline (`radar_app`)
+# FMCW 雷达 GPU 处理工程（`radar_app`）
 
-## 1. Project Overview
+## 1. 项目简介
 
-This project implements an offline/online FMCW radar processing pipeline on CUDA.
+本项目实现了一套基于 CUDA 的 FMCW 雷达处理链，支持离线回放与在线处理场景。
 
-Current workflow (aligned with your S1-S6 description):
+当前流程（对应你课题中的 S1-S6）：
 
-1. High-speed data is streamed to host.
-2. CPU does packet/frame assembly and ping-pong style buffering.
-3. GPU unpacks multi-channel IQ and converts to complex format.
-4. GPU performs RD-related processing, CFAR, and candidate extraction.
-5. GPU/CPU post-processes candidates (DBSCAN + optional single-track selection).
-6. Target list is sent back to CPU for display/logging.
+1. 高速数据流传入主机。
+2. CPU 完成组帧/解包与双缓冲调度。
+3. GPU 对多通道 IQ 数据解包并转换为复数形式。
+4. GPU 执行 RD 相关处理、CFAR 检测与候选点提取。
+5. 对候选点做后处理（DBSCAN + 可选单目标时序选择）。
+6. 检测结果回传 CPU 打印/上报。
 
-Main executable: `radar_app`
+可执行程序：`radar_app`
 
-## 2. Repository Layout
+## 2. 目录结构
 
 ```text
-app/                    # entry + offline replay loop
+app/                    # 主程序入口、离线回放循环
 gpu/
-  RadarPipeline.cu      # pipeline orchestration
-  kernels/              # unpack/power/cfar/monopulse kernels
-io/                     # offline replay, UDP receiver, frame assembler
-model/                  # RadarConfig, target types, channel map
-runtime/                # logger/metrics
+  RadarPipeline.cu      # 总流程调度
+  kernels/              # unpack / power / cfar / monopulse 内核
+io/                     # OfflineReplay、UDP 接收、组帧
+model/                  # RadarConfig、目标结构、通道映射
+runtime/                # Logger、Metrics
 CMakeLists.txt
 ```
 
-## 3. Prerequisites
+## 3. 环境要求
 
-- Linux/WSL2 with NVIDIA GPU support
-- NVIDIA driver installed
-- CUDA toolkit available at `/usr/local/cuda`
+- Linux / WSL2（可访问 NVIDIA GPU）
+- 已安装 NVIDIA 驱动
+- CUDA Toolkit（建议位于 `/usr/local/cuda`）
 - `cmake >= 3.16`
-- `g++` with C++17 support
+- 支持 C++17 的 `g++`
 
-Recommended checks:
+建议先检查：
 
 ```bash
 which nvcc
@@ -45,11 +45,11 @@ nvcc --version
 nvidia-smi
 ```
 
-Important: `which nvcc` should point to a valid CUDA toolkit (for example `/usr/local/cuda/bin/nvcc`), not an old/incompatible toolchain.
+注意：`which nvcc` 必须指向有效 CUDA 工具链（例如 `/usr/local/cuda/bin/nvcc`），避免误用旧版本工具链。
 
-## 4. Build
+## 4. 编译方法
 
-From repository root:
+在仓库根目录执行：
 
 ```bash
 rm -rf build
@@ -59,178 +59,174 @@ rm -rf build
 /usr/bin/cmake --build build -j$(nproc)
 ```
 
-Default arch in `CMakeLists.txt` is currently `86` (RTX 30 series style setup).
+当前 `CMakeLists.txt` 默认架构为 `86`（适配 RTX 30 系列常见环境）。
 
-## 5. Offline Replay Run
+## 5. 离线回放运行
 
-`app/main.cpp` currently expects these files in **current working directory**:
+`app/main.cpp` 默认从**当前工作目录**读取三路离线数据：
 
-- `output_he.dat` (sum channel)
-- `output_cha1.dat` (az diff)
-- `output_cha2.dat` (el diff)
+- `output_he.dat`：和通道（sum）
+- `output_cha1.dat`：方位差通道（az diff）
+- `output_cha2.dat`：俯仰差通道（el diff）
 
-Typical usage:
+常用运行方式：
 
 ```bash
 cd build
 ./radar_app
 ```
 
-Console prints include:
+终端会打印：
 
 - `[CFAR] hits=... peaks=...`
 - `[DBSCAN] in=... clusters=... out=...`
 - `[Offline Frame k] targets=n`
-- `[Primary] ...` (selected primary target)
+- `[Primary] ...`（当前帧主目标）
 
-## 6. Output Files
+## 6. 输出文件说明
 
-### 6.1 Primary Track CSV
+### 6.1 主轨迹 CSV
 
-Offline run writes:
+离线运行会生成：
 
 - `offline_primary_track.csv`
 
-Columns:
+字段如下：
 
 - `frame`
-- `valid` (`1`: primary exists, `0`: none)
-- `targets` (target count in this frame)
-- `primary_idx` (index in current frame target list)
+- `valid`（`1` 表示有主目标，`0` 表示无主目标）
+- `targets`（本帧目标数）
+- `primary_idx`（主目标在本帧目标列表中的索引）
 - `rbin`
-- `dbin_c` (centered Doppler bin)
-- `dbin_u` (unshifted Doppler bin)
+- `dbin_c`（中心化 Doppler bin）
+- `dbin_u`（未中心化 Doppler bin）
 - `range_m`
 - `vel_mps`
 - `snr_db`
 - `az_deg`
 - `el_deg`
 
-### 6.2 Optional RD Power Dumps
+### 6.2 可选 RD 功率图输出
 
-Some runs may produce `power_map_frame_XXX.bin` for debug visualization.
+部分调试流程会生成 `power_map_frame_XXX.bin`，用于离线可视化分析。
 
-## 7. Key Runtime Tuning Parameters
+## 7. 核心参数与调参建议
 
-Defined in `model/RadarConfig.h`, overridden in `app/main.cpp`.
+参数定义在 `model/RadarConfig.h`，可在 `app/main.cpp` 中覆盖。
 
-### CFAR/NMS
+### 7.1 CFAR / NMS
 
-| Parameter | Effect if increased | Effect if decreased |
+| 参数 | 调大影响 | 调小影响 |
 |---|---|---|
-| `cfar_peak_half_window` | stronger suppression, fewer nearby peaks | more peaks, easier multi-peak clutter |
-| `cfar_peak_min_snr_db` | fewer false alarms | more detections, more false alarms |
-| `cfar_zero_doppler_suppress_bins` | suppress near-zero Doppler clutter | keep slow/zero-velocity targets |
-| `cfar_near_range_suppress_bins` | remove near-range artifacts | keep close targets |
+| `cfar_peak_half_window` | 抑制更强，近邻峰更少 | 峰值更密集，杂点更容易出现 |
+| `cfar_peak_min_snr_db` | 误检减少 | 检测更敏感但误检增加 |
+| `cfar_zero_doppler_suppress_bins` | 更强抑制零速杂波 | 保留低速/零速目标 |
+| `cfar_near_range_suppress_bins` | 近距杂波减少 | 可保留更近距离目标 |
 
-### Post-filter
+### 7.2 后处理
 
-| Parameter | Effect |
+| 参数 | 作用 |
 |---|---|
-| `post_min_snr_db` | remove weak detections before tracking |
-| `post_max_abs_vel_mps` | reject impossible high-speed candidates |
-| `post_top_k` | keep only strongest K targets (`0` = keep all) |
+| `post_min_snr_db` | 过滤弱点 |
+| `post_max_abs_vel_mps` | 过滤不合理高速点 |
+| `post_top_k` | 仅保留最强 K 个目标（`0` 为全保留） |
 
-### DBSCAN (range-doppler)
+### 7.3 DBSCAN（二维：range-doppler）
 
-| Parameter | Effect if increased | Effect if decreased |
+| 参数 | 调大影响 | 调小影响 |
 |---|---|---|
-| `dbscan_eps_range_m` | easier merging across range bins | stricter cluster split |
-| `dbscan_eps_velocity_mps` | easier merging across Doppler bins | stricter velocity separation |
-| `dbscan_min_points` | fewer tiny clusters/noise accepted | more tiny clusters accepted |
-| `dbscan_keep_noise` | isolated points may survive | isolated points removed |
+| `dbscan_eps_range_m` | 更容易在距离维合并 | 聚类更严格，易分裂 |
+| `dbscan_eps_velocity_mps` | 更容易在速度维合并 | 速度维更严格分离 |
+| `dbscan_min_points` | 小簇更难保留 | 小簇更容易被保留 |
+| `dbscan_keep_noise` | 孤立点可保留 | 孤立点直接剔除 |
 
-### Single-target temporal mode
+### 7.4 单目标时序模式
 
-| Parameter | Effect |
+| 参数 | 作用 |
 |---|---|
-| `single_target_mode` | continuity-aware target selection |
-| `single_track_gate_range_m` | allowed inter-frame range jump |
-| `single_track_gate_velocity_mps` | allowed inter-frame velocity jump |
-| `single_track_snr_near_max_db` | only evaluate points near top SNR |
+| `single_target_mode` | 启用基于连续性的主目标选择 |
+| `single_track_gate_range_m` | 帧间距离门限 |
+| `single_track_gate_velocity_mps` | 帧间速度门限 |
+| `single_track_snr_near_max_db` | 仅在“接近最大 SNR”的候选中择优 |
 
-## 8. MATLAB Validation Example
+## 8. MATLAB 轨迹验证示例
 
-Use this to inspect extracted primary trajectory:
+用于验证主轨迹是否与 RD 图中亮点运动一致：
 
 ```matlab
 clc; clear; close all;
 
 T = readtable('offline_primary_track.csv');
-
-% valid primary only
-Tv = T(T.valid == 1, :);
+Tv = T(T.valid == 1, :);   % 只看有效主目标
 
 figure('Name','Primary Track');
 subplot(2,1,1);
 plot(Tv.frame, Tv.rbin, 'o-'); grid on;
 xlabel('frame'); ylabel('rbin');
-title('Range Bin Trajectory');
+title('距离 bin 轨迹');
 
 subplot(2,1,2);
 plot(Tv.frame, Tv.dbin_c, 'o-'); grid on;
 xlabel('frame'); ylabel('dbin\_c');
-title('Centered Doppler Bin Trajectory');
+title('中心化多普勒 bin 轨迹');
 ```
 
-Interpretation guideline:
+解读建议：
 
-- Long plateau at a fixed `dbin_c` is normal quantization behavior (bin-level velocity).
-- Sign switch (`+` to `-`) usually indicates radial direction change.
-- A few outlier frames at start/end are common; tune temporal gates to stabilize.
+- `dbin_c` 长时间保持常数是正常的 bin 量化现象。
+- `dbin_c` 正负切换通常对应径向运动方向变化。
+- 起始/末尾少量离群帧常见，可通过门限与时序参数进一步稳住。
 
-## 9. Common Issues
+## 9. 常见问题排查
 
-### `ptxas fatal: Value 'sm_30' is not defined`
+### 9.1 `ptxas fatal: Value 'sm_30' is not defined`
 
-Cause: old/incompatible CUDA toolchain being picked up.
+原因：使用了过旧或不匹配的 CUDA 工具链。
 
-Fix:
+处理：
 
-- Use correct cmake + nvcc explicitly.
-- Reconfigure with `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`.
+- 明确指定 `CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`
+- 重新配置并构建
 
-### CMake uses wrong binary (for example from another toolkit)
+### 9.2 CMake 来自错误路径（例如其他工具软件自带 cmake）
 
-Fix:
+检查并固定使用：
 
 ```bash
 which cmake
 /usr/bin/cmake --version
 ```
 
-Then call `/usr/bin/cmake` explicitly.
+### 9.3 链接错误 `undefined reference to launch_cfar_and_peak_extract...`
 
-### Link error `undefined reference to launch_cfar_and_peak_extract...`
+原因：函数声明和定义签名不一致。
 
-Cause: declaration/definition signature mismatch between pipeline and kernel launcher.
+处理：保持 `RadarPipeline` 调用签名与 `cfar.cu` launcher 完全一致。
 
-Fix: keep the launcher function signature consistent in both declaration and implementation.
+### 9.4 目标数过多或前几帧不稳定
 
-### Too many targets / unstable first frames
+可尝试：
 
-Try:
+- 增大 `cfar_peak_min_snr_db`
+- 增大 `cfar_peak_half_window`
+- 设置 `dbscan_min_points = 2~3`
+- 单目标数据集开启 `single_target_mode = true`
 
-- increase `cfar_peak_min_snr_db`
-- increase `cfar_peak_half_window`
-- set `dbscan_min_points = 2~3`
-- keep `single_target_mode = true` for single-target datasets
+### 9.5 `CUDA error: OS call failed or operation not supported on this OS`
 
-### Runtime error `CUDA error: OS call failed or operation not supported on this OS`
+通常是运行环境无法访问 GPU（例如当前 WSL/容器未正确透传）。
+请先确认 `nvidia-smi` 与 CUDA 运行时可用。
 
-Often environment related (no GPU access in current runtime/WSL session).
-Verify GPU availability with `nvidia-smi` and CUDA runtime access.
+## 10. Git 使用
 
-## 10. Git Quick Start
-
-If local commits already exist:
+本地已有提交时推送到远端：
 
 ```bash
 git remote add origin <repo-url>
 git push -u origin main
 ```
 
-Tag a stable checkpoint:
+建议打版本标签：
 
 ```bash
 git tag -a v0.1.0 -m "first working offline pipeline"
