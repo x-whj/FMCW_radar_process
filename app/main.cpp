@@ -247,7 +247,7 @@ int main(int argc, char **argv)
         {
             throw std::runtime_error("failed to open track csv: " + track_csv);
         }
-        track_ofs << "frame,track_id,confirmed,age,hits,missed,rbin,dbin_c,dbin_u,range_m,vel_mps,snr_db,az_deg,el_deg,power\n";
+        track_ofs << "frame,track_id,confirmed,age,hits,missed,rbin,dbin_c,dbin_u,range_m,vel_mps,snr_db,az_deg,el_deg,az_err,el_err,power\n";
         track_ofs << std::fixed << std::setprecision(6);
 
         std::vector<int16_t> frame_raw;
@@ -338,12 +338,14 @@ int main(int argc, char **argv)
                           << t.snr_db << ","
                           << t.azimuth_deg << ","
                           << t.elevation_deg << ","
+                          << t.az_error << ","
+                          << t.el_error << ","
                           << t.power << "\n";
             }
 
             if (track_count == 0)
             {
-                track_ofs << frame_idx << ",-1,0,0,0,0,-1,-9999,-1,nan,nan,nan,nan,nan,nan\n";
+                track_ofs << frame_idx << ",-1,0,0,0,0,-1,-9999,-1,nan,nan,nan,nan,nan,nan,nan,nan\n";
             }
         }
 

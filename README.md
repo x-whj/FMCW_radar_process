@@ -11,7 +11,7 @@
 3. 各通道执行 Doppler FFT。
 4. 生成和通道 RD 功率图。
 5. 在 RD 图上执行 CFAR + NMS 峰值提取。
-6. 对候选点做单脉冲测角与距离/速度估计。
+6. 对候选点做比幅测角与距离/速度估计。
 7. 主机侧后处理：
    - 基础阈值过滤
    - DBSCAN 候选合并
@@ -107,6 +107,8 @@ cd build
 - `snr_db`
 - `az_deg`
 - `el_deg`
+- `az_err`（比幅测角原始误差，范围通常在 `[-1, 1]`）
+- `el_err`（比幅测角原始误差，范围通常在 `[-1, 1]`）
 - `power`
 
 ### 5.2 RD 功率图导出（调试）
@@ -114,6 +116,9 @@ cd build
 调试时可能输出 `power_map_frame_XXX.bin`，用于离线比对。
 
 ## 6. Track 字段含义
+
+说明：当前工程测角方法为**比幅测角法**（Amplitude Comparison），
+通过 `sum/diff` 重建左右波束幅度并计算幅度比，再通过标定曲线映射到角度。
 
 日志示例：
 
@@ -168,6 +173,7 @@ cd build
 脚本：
 
 - `matlab/plot_multi_track.m`
+- `matlab/fit_angle_calibration.m`
 
 运行方式：
 
@@ -187,6 +193,31 @@ plot_multi_track;
   - frame-SNR
   - range-velocity 相图
   - bin 域总览（`rbin`、`dbin_c`）
+
+### 8.1 角度标定脚本（比幅）
+
+运行方式：
+
+```matlab
+cd('/home/whj/cuda_workplace/radar_app/matlab');
+fit_angle_calibration;
+```
+
+输入：
+
+- `offline_multi_track.csv`（来自离线回放）
+- `angle_truth.csv`（实测真值，字段必须包含）
+  - `frame`
+  - `track_id`
+  - `az_truth_deg`
+  - `el_truth_deg`
+
+输出：
+
+- `angle_calib_lut.csv`（可用于生成 LUT）
+- `angle_calib_result.mat`（包含线性拟合参数和 LUT）
+
+若未提供 `angle_truth.csv`，脚本会自动生成 `angle_truth_template.csv`，填完真值后重命名再运行。
 
 ## 9. 常见问题
 
@@ -232,4 +263,3 @@ git add .
 git commit -m "feat: multi-target tracking pipeline and tuning profiles"
 git push -u origin feature/multi-target-tracking
 ```
-

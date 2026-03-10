@@ -16,6 +16,8 @@ namespace radar
         float velocity_mps;
         float azimuth_deg;
         float elevation_deg;
+        float az_error;
+        float el_error;
         float snr_db;
         float power;
         uint8_t valid_az;
