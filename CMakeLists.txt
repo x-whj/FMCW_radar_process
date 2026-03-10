@@ -13,6 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_executable(radar_app
     app/main.cpp
     io/UdpReceiver.cpp
+    tracking/MultiTargetTracker.cpp
     gpu/RadarPipeline.cu
     gpu/kernels/unpack.cu
     gpu/kernels/power.cu

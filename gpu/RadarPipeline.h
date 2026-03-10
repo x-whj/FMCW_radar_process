@@ -12,6 +12,10 @@
 namespace radar
 {
 
+    // 一帧处理总控类（把各个 CUDA 内核串起来）。
+    // 核心入口：process_frame()
+    // 输入：原始一帧 int16 IQ（设备指针或 mapped 指针）
+    // 输出：RadarTarget 列表（已做后处理/可选单目标选择）
     class RadarPipeline
     {
     public:

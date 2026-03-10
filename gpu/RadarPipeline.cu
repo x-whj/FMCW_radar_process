@@ -40,6 +40,7 @@ namespace radar
         }
     }
 
+    // DBSCAN 邻域判定（在 range-velocity 平面上做“归一化椭圆距离”）
     static bool dbscan_is_neighbor(const RadarTarget &a,
                                    const RadarTarget &b,
                                    float eps_range_m,
@@ -50,7 +51,7 @@ namespace radar
         return (dr * dr + dv * dv) <= 1.0f;
     }
 
-    // Cluster candidate targets in (range, velocity) space, output one representative per cluster.
+    // 在 (range, velocity) 上做 DBSCAN 聚类，每簇输出 1 个代表点（默认选簇内最强点）。
     static int cluster_targets_dbscan(const std::vector<RadarTarget> &input,
                                       const RadarConfig &cfg,
                                       std::vector<RadarTarget> &output)
@@ -191,6 +192,124 @@ namespace radar
         return cluster_count;
     }
 
+    struct DopplerLineSuppressStats
+    {
+        int suppressed_points = 0;
+        int suppressed_bins = 0;
+    };
+
+    static int centered_doppler_bin_from_target(const RadarTarget &target,
+                                                const RadarConfig &cfg)
+    {
+        const float vr = std::fabs(cfg.velocity_resolution_mps);
+        if (vr < 1e-6f)
+        {
+            return 0;
+        }
+        return static_cast<int>(std::lround(target.velocity_mps / cfg.velocity_resolution_mps));
+    }
+
+    static DopplerLineSuppressStats suppress_doppler_line_targets(
+        const std::vector<RadarTarget> &input,
+        const RadarConfig &cfg,
+        std::vector<RadarTarget> &output)
+    {
+        DopplerLineSuppressStats stats{};
+        output.clear();
+
+        if (input.empty() || !cfg.post_doppler_line_suppress_enable)
+        {
+            output = input;
+            return stats;
+        }
+
+        const int min_points = std::max(cfg.post_doppler_line_min_points, 2);
+        const int keep_per_bin = std::max(cfg.post_doppler_line_keep_per_bin, 1);
+
+        struct BinIndex
+        {
+            int dbin = 0;
+            int idx = -1;
+        };
+
+        std::vector<BinIndex> bin_indices;
+        bin_indices.reserve(input.size());
+        for (int i = 0; i < static_cast<int>(input.size()); ++i)
+        {
+            BinIndex b;
+            b.dbin = centered_doppler_bin_from_target(input[i], cfg);
+            b.idx = i;
+            bin_indices.push_back(b);
+        }
+
+        std::sort(bin_indices.begin(), bin_indices.end(),
+                  [](const BinIndex &a, const BinIndex &b)
+                  {
+                      if (a.dbin != b.dbin)
+                          return a.dbin < b.dbin;
+                      return a.idx < b.idx;
+                  });
+
+        std::vector<uint8_t> keep(input.size(), 1);
+
+        int start = 0;
+        while (start < static_cast<int>(bin_indices.size()))
+        {
+            int end = start + 1;
+            const int dbin = bin_indices[start].dbin;
+            while (end < static_cast<int>(bin_indices.size()) &&
+                   bin_indices[end].dbin == dbin)
+            {
+                ++end;
+            }
+
+            const int group_size = end - start;
+            if (group_size >= min_points)
+            {
+                stats.suppressed_bins++;
+                std::vector<int> group;
+                group.reserve(group_size);
+                for (int i = start; i < end; ++i)
+                {
+                    group.push_back(bin_indices[i].idx);
+                }
+
+                std::sort(group.begin(), group.end(),
+                          [&input](int lhs, int rhs)
+                          {
+                              if (input[lhs].snr_db != input[rhs].snr_db)
+                                  return input[lhs].snr_db > input[rhs].snr_db;
+                              return input[lhs].power > input[rhs].power;
+                          });
+
+                for (int idx : group)
+                {
+                    keep[idx] = 0;
+                }
+                const int keep_n = std::min(keep_per_bin, static_cast<int>(group.size()));
+                for (int i = 0; i < keep_n; ++i)
+                {
+                    keep[group[i]] = 1;
+                }
+            }
+
+            start = end;
+        }
+
+        output.reserve(input.size());
+        for (int i = 0; i < static_cast<int>(input.size()); ++i)
+        {
+            if (keep[i])
+            {
+                output.push_back(input[i]);
+            }
+        }
+
+        stats.suppressed_points =
+            static_cast<int>(input.size()) - static_cast<int>(output.size());
+        return stats;
+    }
+
     void upload_slow_time_window(const float *h_window, int count);
 
     void launch_unpack_and_window(cudaStream_t stream,
@@ -266,9 +385,20 @@ namespace radar
     int RadarPipeline::process_frame(const int16_t *d_or_mapped_raw,
                                      std::vector<RadarTarget> &out_targets)
     {
+        // 一帧主流程（建议按以下阶段读代码）：
+        // 1 清理计数与中间缓冲
+        // 2 处理输入来源（mapped zero-copy 或 staged memcpy）
+        // 3 unpack + slow-time window
+        // 4 各通道多普勒 FFT
+        // 5 求和通道功率图
+        // 6 (可选)导出功率图供 Matlab 对比
+        // 7 CFAR + 峰值提取
+        // 8 单脉冲角度/速度/距离形成目标列表
+        // 9~16 主机侧后处理（过滤/聚类/Doppler线抑制/top-k/单目标时序选择）
         const int plane = cfg_.num_chirps * cfg_.num_samples;
         static int s_dump_frame_index = 0;
 
+        // Stage 1: 每帧开始先清理状态缓冲
         CUDA_CHECK(cudaMemsetAsync(buffers_.d_hit_map,
                                    0,
                                    cfg_.rd_map_elements() * sizeof(uint8_t),
@@ -296,6 +426,9 @@ namespace radar
 
         const int16_t *raw_input = d_or_mapped_raw;
 
+        // Stage 2: 输入策略
+        // prefer_mapped_zero_copy=true: kernel 直接读 mapped host 内存
+        // false: 先拷到设备 staging 缓冲，再读
         if (!cfg_.prefer_mapped_zero_copy)
         {
             CUDA_CHECK(cudaMemcpyAsync(buffers_.d_stage_raw,
@@ -306,6 +439,7 @@ namespace radar
             raw_input = buffers_.d_stage_raw;
         }
 
+        // Stage 3: int16 原始 IQ -> float2 复数立方体，并施加慢时间窗
         launch_unpack_and_window(stream_,
                                  raw_input,
                                  buffers_.d_cube,
@@ -313,6 +447,7 @@ namespace radar
                                  cfg_.num_chirps,
                                  cfg_.num_samples);
 
+        // Stage 4: 对每个通道分别做多普勒 FFT（沿 chirp 维）
         for (int ch = 0; ch < cfg_.num_channels; ++ch)
         {
             float2 *ch_ptr = buffers_.d_cube + ch * plane;
@@ -324,12 +459,14 @@ namespace radar
                 CUFFT_FORWARD));
         }
 
+        // Stage 5: 仅用和通道生成功率图（后续 CFAR 在这张图上做）
         launch_sum_channel_power(stream_,
                                  buffers_.d_cube,
                                  buffers_.d_power_map,
                                  chmap_.sum_primary,
                                  plane);
 
+        // Stage 6: 调试导出功率图，便于和 Matlab 逐帧对齐
         {
             std::vector<float> h_power_map(cfg_.rd_map_elements());
 
@@ -348,6 +485,7 @@ namespace radar
             ++s_dump_frame_index;
         }
 
+        // Stage 7: CFAR 命中 + NMS 峰值提取（得到目标候选 bin）
         launch_cfar_and_peak_extract_v2(stream_,
                                         buffers_.d_power_map,
                                         buffers_.d_hit_map,
@@ -371,6 +509,7 @@ namespace radar
                                         cfg_.cfar_peak_min_snr_db,
                                         cfg_.max_targets);
 
+        // Stage 8: 从候选 bin 回查三通道复数数据，计算距离/速度/角度/SNR
         launch_monopulse(stream_,
                          buffers_.d_cube,
                          buffers_.d_detections,
@@ -381,6 +520,7 @@ namespace radar
                          chmap_,
                          calib_);
 
+        // Stage 9: 拷回命中数/峰值数，供日志和后处理使用
         CUDA_CHECK(cudaMemcpyAsync(&h_hit_count_,
                                    buffers_.d_hit_count,
                                    sizeof(int),
@@ -393,6 +533,7 @@ namespace radar
                                    cudaMemcpyDeviceToHost,
                                    stream_));
 
+        // Stage 10: 同步一帧计算完成
         CUDA_CHECK(cudaStreamSynchronize(stream_));
 
         std::cout << "[CFAR] hits=" << h_hit_count_
@@ -405,6 +546,7 @@ namespace radar
 
         std::vector<RadarTarget> raw_targets(valid);
 
+        // Stage 11: 拷回候选目标数组
         if (valid > 0)
         {
             CUDA_CHECK(cudaMemcpy(raw_targets.data(),
@@ -413,7 +555,7 @@ namespace radar
                                   cudaMemcpyDeviceToHost));
         }
 
-        // Host-side post-filtering before tracking / clustering.
+        // Stage 12: 主机侧基础过滤（距离/SNR/最大速度）
         out_targets.clear();
         out_targets.reserve(valid);
 
@@ -431,6 +573,7 @@ namespace radar
             out_targets.push_back(t);
         }
 
+        // Stage 13: DBSCAN 聚类（减少同一目标附近的重复点）
         if (cfg_.dbscan_enable && !out_targets.empty())
         {
             const int before_count = static_cast<int>(out_targets.size());
@@ -443,6 +586,24 @@ namespace radar
                       << std::endl;
         }
 
+        // Stage 14: 同一 Doppler bin 线状杂波抑制（可选）
+        if (cfg_.post_doppler_line_suppress_enable && !out_targets.empty())
+        {
+            const int before_count = static_cast<int>(out_targets.size());
+            std::vector<RadarTarget> doppler_suppressed_targets;
+            const auto stats = suppress_doppler_line_targets(
+                out_targets, cfg_, doppler_suppressed_targets);
+            out_targets.swap(doppler_suppressed_targets);
+            if (stats.suppressed_points > 0)
+            {
+                std::cout << "[DOPPLER] in=" << before_count
+                          << " suppressed_bins=" << stats.suppressed_bins
+                          << " out=" << out_targets.size()
+                          << std::endl;
+            }
+        }
+
+        // Stage 15: 可选仅保留最强 top-k（0 表示不截断）
         if (cfg_.post_top_k > 0 &&
             static_cast<int>(out_targets.size()) > cfg_.post_top_k)
         {
@@ -459,6 +620,7 @@ namespace radar
             out_targets.resize(cfg_.post_top_k);
         }
 
+        // Stage 16: 单目标模式（用于单目标数据集），将输出收敛为 0/1 个目标
         if (cfg_.single_target_mode)
         {
             if (out_targets.empty())
