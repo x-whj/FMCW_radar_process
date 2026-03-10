@@ -8,6 +8,9 @@ namespace radar
 
     struct RadarConfig
     {
+        // ---------- 维度定义 ----------
+        // num_chirps: 一帧内慢时间长度（决定 Doppler bin 数）
+        // num_samples: 每个 chirp 的快时间采样点（决定 Range bin 数）
         int num_channels = 3; // 1 sum + 1 az diff + 1 el diff
         int num_chirps = 256;
         int num_samples = 664;
@@ -35,6 +38,11 @@ namespace radar
         float post_min_snr_db = 0.0f;
         float post_max_abs_vel_mps = 100.0f;
         int post_top_k = 0; // 0: keep all
+        // Suppress strip-like clutter lines: if a centered Doppler bin has too many points,
+        // keep only strongest K points in that bin.
+        bool post_doppler_line_suppress_enable = false;
+        int post_doppler_line_min_points = 6;
+        int post_doppler_line_keep_per_bin = 1;
 
         // DBSCAN clustering on (range, doppler) candidate points
         bool dbscan_enable = true;
@@ -43,6 +51,26 @@ namespace radar
         int dbscan_min_points = 2;
         bool dbscan_keep_noise = true;
         int dbscan_max_clusters = 0; // 0: keep all clusters, >0: keep strongest K clusters
+
+        // Multi-target tracker parameters.
+        bool tracking_enable = true;
+        float tracking_frame_dt_s = 0.1f;
+        float tracking_gate_range_m = 1.2f;
+        float tracking_gate_velocity_mps = 2.0f;
+        float tracking_process_noise_range_m = 0.30f;
+        float tracking_process_noise_velocity_mps = 0.60f;
+        float tracking_measurement_noise_range_m = 0.20f;
+        float tracking_measurement_noise_velocity_mps = 0.40f;
+        int tracking_confirm_hits = 3;
+        int tracking_max_missed_frames = 5;
+        bool tracking_output_tentative = false;
+        bool tracking_output_only_updated_tracks = true;
+        int tracking_output_min_age = 1;
+        int tracking_output_min_hits = 1;
+        int tracking_max_tracks = 128;
+        float tracking_spawn_min_snr_db = 0.0f;
+        float tracking_spawn_exclusion_range_m = 0.0f;
+        float tracking_spawn_exclusion_velocity_mps = 0.0f;
 
         // Optional temporal selection for single-target scenes.
         bool single_target_mode = true;
@@ -58,6 +86,10 @@ namespace radar
         float single_track_reacquire_max_velocity_jump_mps = 7.0f;
         int single_track_max_missed_frames = 2;
 
+        // ---------- bin 到物理量的换算 ----------
+        // range_m ~= range_bin * range_resolution_m
+        // velocity_mps ~= doppler_bin_centered * velocity_resolution_mps
+        // 注意：当前 velocity_resolution_mps 是工程标定值，不是自动从波形参数实时反推。
         float range_resolution_m = 0.15f;
         float velocity_resolution_mps = 0.2f;
 
