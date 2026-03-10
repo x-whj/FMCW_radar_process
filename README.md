@@ -1,44 +1,44 @@
-# FMCW Radar GPU Pipeline (Multi-Target Tracking)
+# FMCW 雷达 GPU 处理流水线（多目标追踪）
 
-## 1. Overview
+## 1. 项目概述
 
-This project implements a CUDA-based FMCW radar processing pipeline for offline replay and online integration.
+本项目实现了一套基于 CUDA 的 FMCW 雷达处理链，支持离线回放与后续在线集成。
 
-Current end-to-end flow:
+当前端到端流程：
 
-1. Ingest multi-channel IQ payload.
-2. GPU unpack + slow-time window.
-3. Doppler FFT per channel.
-4. Sum-channel RD power map.
-5. CFAR + NMS peak extraction on RD map.
-6. Monopulse angle/range/velocity estimation for detections.
-7. Host-side post processing:
-   - basic threshold filtering
-   - DBSCAN candidate merging
-   - optional Doppler-line clutter suppression
-8. Multi-target tracking (Kalman + gated data association + track lifecycle).
-9. Track output to CSV.
+1. 读取多通道 IQ 原始数据。
+2. GPU 执行 unpack + 慢时间加窗。
+3. 各通道执行 Doppler FFT。
+4. 生成和通道 RD 功率图。
+5. 在 RD 图上执行 CFAR + NMS 峰值提取。
+6. 对候选点做单脉冲测角与距离/速度估计。
+7. 主机侧后处理：
+   - 基础阈值过滤
+   - DBSCAN 候选合并
+   - 可选的 Doppler 线杂波抑制
+8. 多目标追踪（Kalman + 门控关联 + 轨迹生命周期）。
+9. 将轨迹输出到 CSV。
 
-Executable: `radar_app`
+可执行文件：`radar_app`
 
-## 2. Repository Layout
+## 2. 目录结构
 
 ```text
-app/                    # Main executable entry and replay loop
+app/                    # 主程序入口与离线回放循环
 gpu/
-  RadarPipeline.cu      # Main GPU + host post-processing pipeline
-  kernels/              # unpack / power / cfar / monopulse kernels
+  RadarPipeline.cu      # GPU主流程 + 主机侧后处理
+  kernels/              # unpack / power / cfar / monopulse 内核
 tracking/
-  MultiTargetTracker.*  # Multi-target tracking logic
-io/                     # OfflineReplay, UDP receiver, frame assembly
-model/                  # RadarConfig, target structs, channel map
-runtime/                # Logger, metrics
+  MultiTargetTracker.*  # 多目标追踪模块
+io/                     # OfflineReplay、UDP接收、组帧
+model/                  # RadarConfig、目标结构、通道映射
+runtime/                # 日志、统计
 matlab/
-  plot_multi_track.m    # Track visualization script
+  plot_multi_track.m    # 轨迹可视化脚本
 CMakeLists.txt
 ```
 
-## 3. Build
+## 3. 编译
 
 ```bash
 rm -rf build
@@ -48,20 +48,20 @@ rm -rf build
 /usr/bin/cmake --build build -j$(nproc)
 ```
 
-## 4. Run Offline Replay
+## 4. 离线回放运行
 
-`radar_app` reads these files from current working directory:
+`radar_app` 会从当前工作目录读取以下文件：
 
-- `output_he.dat` (sum channel)
-- `output_cha1.dat` (azimuth diff channel)
-- `output_cha2.dat` (elevation diff channel)
+- `output_he.dat`（和通道）
+- `output_cha1.dat`（方位差通道）
+- `output_cha2.dat`（俯仰差通道）
 
-### 4.1 Profiles
+### 4.1 运行配置档（profile）
 
-Two runtime tuning profiles are supported:
+支持两套运行参数：
 
-- `single` (default): conservative, stable for single-target-like data.
-- `multi`: more permissive for multi-target scenes.
+- `single`（默认）：更保守，适合单目标/低杂波场景。
+- `multi`：更宽松，适合多目标场景。
 
 ```bash
 cd build
@@ -69,39 +69,39 @@ cd build
 ./radar_app --profile multi
 ```
 
-Help:
+帮助：
 
 ```bash
 ./radar_app --help
 ```
 
-Console output includes:
+终端日志包含：
 
 - `[CFAR] hits=... peaks=...`
 - `[DBSCAN] in=... clusters=... out=...`
-- `[DOPPLER] in=... suppressed_bins=... out=...` (when enabled)
+- `[DOPPLER] in=... suppressed_bins=... out=...`（启用时）
 - `[Offline Frame k] detections=n tracks=m`
-- `[Det] ...` and `[Track] ...`
+- `[Det] ...` 与 `[Track] ...`
 
-## 5. Output Files
+## 5. 输出文件
 
-### 5.1 Multi-track CSV
+### 5.1 多轨迹 CSV
 
-Offline run writes:
+离线运行输出：
 
 - `offline_multi_track.csv`
 
-Fields:
+字段说明：
 
 - `frame`
-- `track_id` (`-1` means no output track in this frame)
-- `confirmed` (`1` confirmed, `0` otherwise)
-- `age` (track lifetime in frames)
-- `hits` (associated detection count)
-- `missed` (consecutive misses)
+- `track_id`（`-1` 表示该帧无输出轨迹）
+- `confirmed`（`1` 已确认，`0` 未确认）
+- `age`（轨迹生命周期，单位帧）
+- `hits`（成功关联次数）
+- `missed`（连续丢失帧数）
 - `rbin`
-- `dbin_c` (centered Doppler bin)
-- `dbin_u` (unshifted Doppler bin)
+- `dbin_c`（中心化 Doppler bin）
+- `dbin_u`（未中心化 Doppler bin）
 - `range_m`
 - `vel_mps`
 - `snr_db`
@@ -109,32 +109,32 @@ Fields:
 - `el_deg`
 - `power`
 
-### 5.2 RD Power Dump (debug)
+### 5.2 RD 功率图导出（调试）
 
-`power_map_frame_XXX.bin` may be generated for RD comparison/debug.
+调试时可能输出 `power_map_frame_XXX.bin`，用于离线比对。
 
-## 6. Tracking Semantics
+## 6. Track 字段含义
 
-Track line example:
+日志示例：
 
 ```text
 [Track] id=98 conf=1 age=18 hits=18 miss=0 rbin=24 dbin_c=-15 range=3.6 m vel=-3.0 m/s snr=27.54 dB
 ```
 
-Meaning:
+含义：
 
-- `id`: track identity.
-- `conf`: whether the track is confirmed by hit history.
-- `age`: number of frames since track birth.
-- `hits`: number of successful updates.
-- `miss`: consecutive unmatched frames.
-- `range/vel`: filtered track state.
+- `id`：轨迹编号
+- `conf`：是否已确认轨迹
+- `age`：轨迹已存在帧数
+- `hits`：累计命中次数
+- `miss`：连续丢失次数
+- `range/vel`：滤波后的轨迹状态
 
-## 7. Key Parameters
+## 7. 关键参数
 
-Parameters live in `model/RadarConfig.h`, and profile defaults are set in `app/main.cpp`.
+参数定义在 `model/RadarConfig.h`，默认 profile 在 `app/main.cpp` 设置。
 
-### 7.1 Detection / Post-processing
+### 7.1 检测与后处理
 
 - `cfar_peak_min_snr_db`
 - `cfar_peak_half_window`
@@ -145,7 +145,7 @@ Parameters live in `model/RadarConfig.h`, and profile defaults are set in `app/m
 - `post_doppler_line_min_points`
 - `post_doppler_line_keep_per_bin`
 
-### 7.2 Tracking
+### 7.2 追踪
 
 - `tracking_gate_range_m`
 - `tracking_gate_velocity_mps`
@@ -158,71 +158,73 @@ Parameters live in `model/RadarConfig.h`, and profile defaults are set in `app/m
 - `tracking_output_min_age`
 - `tracking_output_min_hits`
 
-For suppressing short-lived false tracks, increase:
+若要抑制短命假轨迹，可调大：
 
 - `tracking_output_min_age`
 - `tracking_output_min_hits`
 
-## 8. MATLAB Visualization
+## 8. MATLAB 轨迹可视化
 
-Script:
+脚本：
 
 - `matlab/plot_multi_track.m`
 
-Usage:
+运行方式：
 
 ```matlab
 cd('/home/whj/cuda_workplace/radar_app/matlab');
 plot_multi_track;
 ```
 
-The script:
+脚本功能：
 
-- loads `offline_multi_track.csv`
-- keeps confirmed tracks
-- filters short tracks by `min_track_rows` (default `6`)
-- plots:
+- 读取 `offline_multi_track.csv`
+- 保留 confirmed 轨迹
+- 用 `min_track_rows`（默认 `6`）过滤短轨迹
+- 绘制：
   - frame-range
   - frame-velocity
   - frame-SNR
-  - range-velocity phase plot
-  - bin-domain overview (`rbin`, `dbin_c`)
+  - range-velocity 相图
+  - bin 域总览（`rbin`、`dbin_c`）
 
-## 9. Troubleshooting
+## 9. 常见问题
 
 ### 9.1 `CUDA error: OS call failed or operation not supported on this OS`
 
-GPU runtime is not available in the environment (common in misconfigured WSL/container). Verify:
+通常表示当前环境无法访问 GPU（常见于 WSL/容器配置问题）。
+
+先检查：
 
 ```bash
 nvidia-smi
 ```
 
-### 9.2 Too many detections/tracks
+### 9.2 目标/轨迹数量过多
 
-Try:
+可尝试：
 
-- increasing `cfar_peak_min_snr_db`
-- increasing `post_min_snr_db`
-- increasing `dbscan_min_points`
-- enabling/tuning Doppler-line suppression
-- increasing `tracking_output_min_hits` / `tracking_output_min_age`
+- 调高 `cfar_peak_min_snr_db`
+- 调高 `post_min_snr_db`
+- 调高 `dbscan_min_points`
+- 开启并收紧 Doppler 线抑制
+- 调高 `tracking_output_min_hits` / `tracking_output_min_age`
 
-### 9.3 Too many track breaks
+### 9.3 轨迹容易断
 
-Try:
+可尝试：
 
-- reducing `tracking_confirm_hits`
-- increasing `tracking_max_missed_frames`
-- slightly relaxing `tracking_gate_*`
+- 降低 `tracking_confirm_hits`
+- 增大 `tracking_max_missed_frames`
+- 略微放宽 `tracking_gate_*`
 
-## 10. Git Workflow
+## 10. Git 工作流
 
-Current multi-target work is on branch:
+当前多目标开发分支：
 
 - `feature/multi-target-tracking`
 
-Typical commands:
+常用命令：
 
 ```bash
 git status
