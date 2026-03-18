@@ -229,6 +229,7 @@ int main(int argc, char **argv)
 
         Logger::info("Offline replay initialized.");
         Logger::info("  profile = ", (profile == TuneProfile::MultiTarget) ? "multi" : "single");
+        Logger::info("  input_mode = ", cfg.prefer_mapped_zero_copy ? "zero_copy_mapped_host" : "device_staging_copy");
         Logger::info("  sum_file = ", sum_file);
         Logger::info("  az_file  = ", az_file);
         Logger::info("  el_file  = ", el_file);
@@ -276,27 +277,56 @@ int main(int argc, char **argv)
                 track_count = tracker.update(detections, tracks);
             }
 
-            std::cout << "[Offline Frame " << frame_idx << "] detections=" << detection_count
-                      << " tracks=" << track_count << std::endl;
-
-            for (int i = 0; i < detection_count; ++i)
+            if (cfg.verbose_frame_logs)
             {
-                const auto &t = detections[i];
-                const int range_bin = static_cast<int>(std::lround(t.range_m / cfg.range_resolution_m));
-                const int doppler_bin_centered = static_cast<int>(std::lround(t.velocity_mps / cfg.velocity_resolution_mps));
-                int doppler_bin_unshifted = doppler_bin_centered;
-                if (doppler_bin_unshifted < 0)
+                std::cout << "[Offline Frame " << frame_idx << "] detections=" << detection_count
+                          << " tracks=" << track_count << std::endl;
+
+                for (int i = 0; i < detection_count; ++i)
                 {
-                    doppler_bin_unshifted += cfg.num_chirps;
+                    const auto &t = detections[i];
+                    const int range_bin = static_cast<int>(std::lround(t.range_m / cfg.range_resolution_m));
+                    const int doppler_bin_centered = static_cast<int>(std::lround(t.velocity_mps / cfg.velocity_resolution_mps));
+                    int doppler_bin_unshifted = doppler_bin_centered;
+                    if (doppler_bin_unshifted < 0)
+                    {
+                        doppler_bin_unshifted += cfg.num_chirps;
+                    }
+                    std::cout << "  [Det] idx=" << i
+                              << " rbin=" << range_bin
+                              << " dbin_c=" << doppler_bin_centered
+                              << " dbin_u=" << doppler_bin_unshifted
+                              << " range=" << t.range_m << " m"
+                              << " vel=" << t.velocity_mps << " m/s"
+                              << " snr=" << t.snr_db << " dB"
+                              << std::endl;
                 }
-                std::cout << "  [Det] idx=" << i
-                          << " rbin=" << range_bin
-                          << " dbin_c=" << doppler_bin_centered
-                          << " dbin_u=" << doppler_bin_unshifted
-                          << " range=" << t.range_m << " m"
-                          << " vel=" << t.velocity_mps << " m/s"
-                          << " snr=" << t.snr_db << " dB"
-                          << std::endl;
+
+                for (int i = 0; i < track_count; ++i)
+                {
+                    const auto &tr = tracks[i];
+                    const auto &t = tr.target;
+
+                    const int rbin = static_cast<int>(std::lround(t.range_m / cfg.range_resolution_m));
+                    const int dbin_c = static_cast<int>(std::lround(t.velocity_mps / cfg.velocity_resolution_mps));
+                    int dbin_u = dbin_c;
+                    if (dbin_u < 0)
+                    {
+                        dbin_u += cfg.num_chirps;
+                    }
+
+                    std::cout << "  [Track] id=" << tr.track_id
+                              << " conf=" << static_cast<int>(tr.confirmed)
+                              << " age=" << tr.age
+                              << " hits=" << tr.hit_count
+                              << " miss=" << tr.missed_frames
+                              << " rbin=" << rbin
+                              << " dbin_c=" << dbin_c
+                              << " range=" << t.range_m << " m"
+                              << " vel=" << t.velocity_mps << " m/s"
+                              << " snr=" << t.snr_db << " dB"
+                              << std::endl;
+                }
             }
 
             for (int i = 0; i < track_count; ++i)
@@ -311,18 +341,6 @@ int main(int argc, char **argv)
                 {
                     dbin_u += cfg.num_chirps;
                 }
-
-                std::cout << "  [Track] id=" << tr.track_id
-                          << " conf=" << static_cast<int>(tr.confirmed)
-                          << " age=" << tr.age
-                          << " hits=" << tr.hit_count
-                          << " miss=" << tr.missed_frames
-                          << " rbin=" << rbin
-                          << " dbin_c=" << dbin_c
-                          << " range=" << t.range_m << " m"
-                          << " vel=" << t.velocity_mps << " m/s"
-                          << " snr=" << t.snr_db << " dB"
-                          << std::endl;
 
                 track_ofs << frame_idx << ","
                           << tr.track_id << ","
@@ -348,6 +366,8 @@ int main(int argc, char **argv)
                 track_ofs << frame_idx << ",-1,0,0,0,0,-1,-9999,-1,nan,nan,nan,nan,nan,nan,nan,nan\n";
             }
         }
+
+        pipeline.print_signal_timing_summary();
 
         if (h_mapped)
         {

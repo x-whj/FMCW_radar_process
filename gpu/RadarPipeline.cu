@@ -12,6 +12,69 @@
 
 namespace radar
 {
+    namespace
+    {
+        static void print_signal_timing_summary_impl(const SignalTimingSummary &summary)
+        {
+            const double frame_count = (summary.frame_count > 0)
+                                           ? static_cast<double>(summary.frame_count)
+                                           : 1.0;
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] 处理帧数=" << summary.frame_count;
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] 解包加窗累计=" << summary.total_unpack_window_ms << " ms"
+                << " 平均每帧=" << (summary.total_unpack_window_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] FFT累计=" << summary.total_fft_ms << " ms"
+                << " 平均每帧=" << (summary.total_fft_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] 功率图累计=" << summary.total_power_ms << " ms"
+                << " 平均每帧=" << (summary.total_power_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] MTD累计=" << summary.total_mtd_ms << " ms"
+                << " 平均每帧=" << (summary.total_mtd_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] CFAR累计=" << summary.total_cfar_ms << " ms"
+                << " 平均每帧=" << (summary.total_cfar_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] 测角累计=" << summary.total_angle_ms << " ms"
+                << " 平均每帧=" << (summary.total_angle_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+
+            oss.str("");
+            oss.clear();
+            oss << std::fixed << std::setprecision(3)
+                << "[信号处理性能汇总] 总处理累计=" << summary.total_signal_ms << " ms"
+                << " 平均每帧=" << (summary.total_signal_ms / frame_count) << " ms";
+            std::cout << oss.str() << std::endl;
+        }
+    } // namespace
+
     static void dump_power_map_to_file(const float *h_power_map,
                                        int num_chirps,
                                        int num_samples,
@@ -346,7 +409,8 @@ namespace radar
                                          int zero_doppler_suppress_bins,
                                          int peak_half_window,
                                          float peak_min_snr_db,
-                                         int max_targets);
+                                         int max_targets,
+                                         bool collect_hit_count);
 
     void launch_monopulse(cudaStream_t stream,
                           const float2 *cube,
@@ -365,6 +429,15 @@ namespace radar
 
     RadarPipeline::~RadarPipeline()
     {
+        for (auto &event : timing_events_)
+        {
+            if (event)
+            {
+                cudaEventDestroy(event);
+                event = nullptr;
+            }
+        }
+
         fft_plan_.destroy();
         free_gpu_buffers(buffers_);
         if (stream_)
@@ -377,9 +450,18 @@ namespace radar
     void RadarPipeline::initialize(const float *h_window_256)
     {
         CUDA_CHECK(cudaStreamCreate(&stream_));
+        for (auto &event : timing_events_)
+        {
+            CUDA_CHECK(cudaEventCreate(&event));
+        }
         allocate_gpu_buffers(cfg_, buffers_);
         fft_plan_.create(cfg_, stream_);
         upload_slow_time_window(h_window_256, cfg_.num_chirps);
+    }
+
+    void RadarPipeline::print_signal_timing_summary() const
+    {
+        print_signal_timing_summary_impl(signal_timing_summary_);
     }
 
     int RadarPipeline::process_frame(const int16_t *d_or_mapped_raw,
@@ -398,31 +480,31 @@ namespace radar
         const int plane = cfg_.num_chirps * cfg_.num_samples;
         static int s_dump_frame_index = 0;
 
-        // Stage 1: 每帧开始先清理状态缓冲
-        CUDA_CHECK(cudaMemsetAsync(buffers_.d_hit_map,
-                                   0,
-                                   cfg_.rd_map_elements() * sizeof(uint8_t),
-                                   stream_));
+        enum TimingEventIndex
+        {
+            kEvtBeforeUnpackWindow = 0,
+            kEvtAfterUnpackWindow,
+            kEvtAfterMtdFft,
+            kEvtAfterSumPower,
+            kEvtBeforeCfarPeak,
+            kEvtAfterCfarPeak,
+            kEvtAfterMonopulse,
+            kEvtCount
+        };
 
-        CUDA_CHECK(cudaMemsetAsync(buffers_.d_noise_map,
-                                   0,
-                                   cfg_.rd_map_bytes(),
-                                   stream_));
+        static_assert(kEvtCount == kTimingEventCount, "timing event count mismatch");
 
-        CUDA_CHECK(cudaMemsetAsync(buffers_.d_threshold_map,
-                                   0,
-                                   cfg_.rd_map_bytes(),
-                                   stream_));
+        auto record_timing_event = [this](int idx)
+        {
+            CUDA_CHECK(cudaEventRecord(timing_events_[idx], stream_));
+        };
 
-        CUDA_CHECK(cudaMemsetAsync(buffers_.d_hit_count,
-                                   0,
-                                   sizeof(int),
-                                   stream_));
-
-        CUDA_CHECK(cudaMemsetAsync(buffers_.d_peak_count,
-                                   0,
-                                   sizeof(int),
-                                   stream_));
+        auto event_elapsed_ms = [this](int start_idx, int end_idx)
+        {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, timing_events_[start_idx], timing_events_[end_idx]));
+            return ms;
+        };
 
         const int16_t *raw_input = d_or_mapped_raw;
 
@@ -440,12 +522,14 @@ namespace radar
         }
 
         // Stage 3: int16 原始 IQ -> float2 复数立方体，并施加慢时间窗
+        record_timing_event(kEvtBeforeUnpackWindow);
         launch_unpack_and_window(stream_,
                                  raw_input,
                                  buffers_.d_cube,
                                  cfg_.num_channels,
                                  cfg_.num_chirps,
                                  cfg_.num_samples);
+        record_timing_event(kEvtAfterUnpackWindow);
 
         // Stage 4: 对每个通道分别做多普勒 FFT（沿 chirp 维）
         for (int ch = 0; ch < cfg_.num_channels; ++ch)
@@ -458,6 +542,7 @@ namespace radar
                 reinterpret_cast<cufftComplex *>(ch_ptr),
                 CUFFT_FORWARD));
         }
+        record_timing_event(kEvtAfterMtdFft);
 
         // Stage 5: 仅用和通道生成功率图（后续 CFAR 在这张图上做）
         launch_sum_channel_power(stream_,
@@ -465,8 +550,10 @@ namespace radar
                                  buffers_.d_power_map,
                                  chmap_.sum_primary,
                                  plane);
+        record_timing_event(kEvtAfterSumPower);
 
         // Stage 6: 调试导出功率图，便于和 Matlab 逐帧对齐
+        if (cfg_.debug_dump_power_map)
         {
             std::vector<float> h_power_map(cfg_.rd_map_elements());
 
@@ -486,11 +573,12 @@ namespace radar
         }
 
         // Stage 7: CFAR 命中 + NMS 峰值提取（得到目标候选 bin）
+        record_timing_event(kEvtBeforeCfarPeak);
         launch_cfar_and_peak_extract_v2(stream_,
                                         buffers_.d_power_map,
                                         buffers_.d_hit_map,
                                         buffers_.d_noise_map,
-                                        buffers_.d_threshold_map,
+                                        nullptr,
                                         buffers_.d_detections,
                                         buffers_.d_hit_count,
                                         buffers_.d_peak_count,
@@ -507,7 +595,9 @@ namespace radar
                                         cfg_.cfar_zero_doppler_suppress_bins,
                                         cfg_.cfar_peak_half_window,
                                         cfg_.cfar_peak_min_snr_db,
-                                        cfg_.max_targets);
+                                        cfg_.max_targets,
+                                        cfg_.verbose_frame_logs);
+        record_timing_event(kEvtAfterCfarPeak);
 
         // Stage 8: 从候选 bin 回查三通道复数数据，计算距离/速度/角度/SNR
         launch_monopulse(stream_,
@@ -519,13 +609,17 @@ namespace radar
                          cfg_,
                          chmap_,
                          calib_);
+        record_timing_event(kEvtAfterMonopulse);
 
         // Stage 9: 拷回命中数/峰值数，供日志和后处理使用
-        CUDA_CHECK(cudaMemcpyAsync(&h_hit_count_,
-                                   buffers_.d_hit_count,
-                                   sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   stream_));
+        if (cfg_.verbose_frame_logs)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(&h_hit_count_,
+                                       buffers_.d_hit_count,
+                                       sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       stream_));
+        }
 
         CUDA_CHECK(cudaMemcpyAsync(&h_peak_count_,
                                    buffers_.d_peak_count,
@@ -536,9 +630,29 @@ namespace radar
         // Stage 10: 同步一帧计算完成
         CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-        std::cout << "[CFAR] hits=" << h_hit_count_
-                  << " peaks=" << h_peak_count_
-                  << std::endl;
+        const double unpack_window_ms = static_cast<double>(event_elapsed_ms(kEvtBeforeUnpackWindow, kEvtAfterUnpackWindow));
+        const double mtd_fft_ms = static_cast<double>(event_elapsed_ms(kEvtAfterUnpackWindow, kEvtAfterMtdFft));
+        const double sum_power_ms = static_cast<double>(event_elapsed_ms(kEvtAfterMtdFft, kEvtAfterSumPower));
+        const double cfar_peak_ms = static_cast<double>(event_elapsed_ms(kEvtBeforeCfarPeak, kEvtAfterCfarPeak));
+        const double monopulse_ms = static_cast<double>(event_elapsed_ms(kEvtAfterCfarPeak, kEvtAfterMonopulse));
+        const double mtd_total_ms = unpack_window_ms + mtd_fft_ms + sum_power_ms;
+        const double signal_total_ms = mtd_total_ms + cfar_peak_ms + monopulse_ms;
+
+        signal_timing_summary_.frame_count++;
+        signal_timing_summary_.total_unpack_window_ms += unpack_window_ms;
+        signal_timing_summary_.total_fft_ms += mtd_fft_ms;
+        signal_timing_summary_.total_power_ms += sum_power_ms;
+        signal_timing_summary_.total_mtd_ms += mtd_total_ms;
+        signal_timing_summary_.total_cfar_ms += cfar_peak_ms;
+        signal_timing_summary_.total_angle_ms += monopulse_ms;
+        signal_timing_summary_.total_signal_ms += signal_total_ms;
+
+        if (cfg_.verbose_frame_logs)
+        {
+            std::cout << "[CFAR] hits=" << h_hit_count_
+                      << " peaks=" << h_peak_count_
+                      << std::endl;
+        }
 
         const int valid = (h_peak_count_ > cfg_.max_targets)
                               ? cfg_.max_targets
@@ -580,10 +694,13 @@ namespace radar
             std::vector<RadarTarget> clustered_targets;
             const int cluster_count = cluster_targets_dbscan(out_targets, cfg_, clustered_targets);
             out_targets.swap(clustered_targets);
-            std::cout << "[DBSCAN] in=" << before_count
-                      << " clusters=" << cluster_count
-                      << " out=" << out_targets.size()
-                      << std::endl;
+            if (cfg_.verbose_frame_logs)
+            {
+                std::cout << "[DBSCAN] in=" << before_count
+                          << " clusters=" << cluster_count
+                          << " out=" << out_targets.size()
+                          << std::endl;
+            }
         }
 
         // Stage 14: 同一 Doppler bin 线状杂波抑制（可选）
@@ -594,7 +711,7 @@ namespace radar
             const auto stats = suppress_doppler_line_targets(
                 out_targets, cfg_, doppler_suppressed_targets);
             out_targets.swap(doppler_suppressed_targets);
-            if (stats.suppressed_points > 0)
+            if (cfg_.verbose_frame_logs && stats.suppressed_points > 0)
             {
                 std::cout << "[DOPPLER] in=" << before_count
                           << " suppressed_bins=" << stats.suppressed_bins
@@ -623,6 +740,7 @@ namespace radar
         // Stage 16: 单目标模式（用于单目标数据集），将输出收敛为 0/1 个目标
         if (cfg_.single_target_mode)
         {
+            bool output_empty = false;
             if (out_targets.empty())
             {
                 single_track_missed_frames_++;
@@ -630,141 +748,147 @@ namespace radar
                 {
                     single_track_initialized_ = false;
                 }
-                return 0;
+                output_empty = true;
             }
 
-            float frame_snr_max = out_targets[0].snr_db;
-            for (int i = 1; i < static_cast<int>(out_targets.size()); ++i)
+            if (!output_empty)
             {
-                frame_snr_max = std::max(frame_snr_max, out_targets[i].snr_db);
-            }
-            const bool allow_soft_reseed =
-                single_track_initialized_ &&
-                (single_track_last_.snr_db + cfg_.single_track_snr_near_max_db < frame_snr_max);
-
-            int best_idx = -1;
-            float best_score = -std::numeric_limits<float>::infinity();
-            const float dt = std::max(cfg_.single_track_frame_dt_s, 1e-3f);
-
-            for (int i = 0; i < static_cast<int>(out_targets.size()); ++i)
-            {
-                const auto &t = out_targets[i];
-                if (t.snr_db < frame_snr_max - cfg_.single_track_snr_near_max_db)
+                float frame_snr_max = out_targets[0].snr_db;
+                for (int i = 1; i < static_cast<int>(out_targets.size()); ++i)
                 {
-                    continue;
+                    frame_snr_max = std::max(frame_snr_max, out_targets[i].snr_db);
                 }
+                const bool allow_soft_reseed =
+                    single_track_initialized_ &&
+                    (single_track_last_.snr_db + cfg_.single_track_snr_near_max_db < frame_snr_max);
 
-                float dr = 0.0f;
-                float dv = 0.0f;
-                float dv_kin = 0.0f;
-                float range_penalty = cfg_.single_track_range_penalty;
-                float velocity_penalty = cfg_.single_track_velocity_penalty;
-                float kinematic_penalty = cfg_.single_track_kinematic_penalty;
-                if (single_track_initialized_)
+                int best_idx = -1;
+                float best_score = -std::numeric_limits<float>::infinity();
+                const float dt = std::max(cfg_.single_track_frame_dt_s, 1e-3f);
+
+                for (int i = 0; i < static_cast<int>(out_targets.size()); ++i)
                 {
-                    dr = std::fabs(t.range_m - single_track_last_.range_m);
-                    dv = std::fabs(t.velocity_mps - single_track_last_.velocity_mps);
-                    if (!allow_soft_reseed &&
-                        (dr > cfg_.single_track_gate_range_m ||
-                         dv > cfg_.single_track_gate_velocity_mps))
+                    const auto &t = out_targets[i];
+                    if (t.snr_db < frame_snr_max - cfg_.single_track_snr_near_max_db)
                     {
                         continue;
                     }
 
-                    const float v_from_range =
-                        (t.range_m - single_track_last_.range_m) / dt;
-                    dv_kin = std::fabs(t.velocity_mps - v_from_range);
-                    if (!allow_soft_reseed &&
-                        dv_kin > cfg_.single_track_kinematic_mismatch_mps)
+                    float dr = 0.0f;
+                    float dv = 0.0f;
+                    float dv_kin = 0.0f;
+                    float range_penalty = cfg_.single_track_range_penalty;
+                    float velocity_penalty = cfg_.single_track_velocity_penalty;
+                    float kinematic_penalty = cfg_.single_track_kinematic_penalty;
+                    if (single_track_initialized_)
                     {
-                        continue;
-                    }
-
-                    if (allow_soft_reseed)
-                    {
-                        range_penalty *= 0.25f;
-                        velocity_penalty *= 0.1f;
-                        kinematic_penalty = 0.0f;
-                    }
-                }
-
-                const float score =
-                    t.snr_db -
-                    range_penalty * dr -
-                    velocity_penalty * dv -
-                    kinematic_penalty * dv_kin -
-                    cfg_.single_track_abs_velocity_penalty * std::fabs(t.velocity_mps);
-
-                if (score > best_score)
-                {
-                    best_score = score;
-                    best_idx = i;
-                }
-            }
-
-            if (best_idx < 0)
-            {
-                if (single_track_initialized_)
-                {
-                    int reacquire_idx = -1;
-                    float best_reacquire_cost = std::numeric_limits<float>::infinity();
-                    for (int i = 0; i < static_cast<int>(out_targets.size()); ++i)
-                    {
-                        const auto &t = out_targets[i];
-                        if (t.snr_db < frame_snr_max - cfg_.single_track_snr_near_max_db)
+                        dr = std::fabs(t.range_m - single_track_last_.range_m);
+                        dv = std::fabs(t.velocity_mps - single_track_last_.velocity_mps);
+                        if (!allow_soft_reseed &&
+                            (dr > cfg_.single_track_gate_range_m ||
+                             dv > cfg_.single_track_gate_velocity_mps))
                         {
                             continue;
                         }
 
-                        const float dr = std::fabs(t.range_m - single_track_last_.range_m);
-                        const float dv = std::fabs(t.velocity_mps - single_track_last_.velocity_mps);
-                        if (dv > cfg_.single_track_reacquire_max_velocity_jump_mps)
+                        const float v_from_range =
+                            (t.range_m - single_track_last_.range_m) / dt;
+                        dv_kin = std::fabs(t.velocity_mps - v_from_range);
+                        if (!allow_soft_reseed &&
+                            dv_kin > cfg_.single_track_kinematic_mismatch_mps)
                         {
                             continue;
                         }
 
-                        const float reacquire_cost = dv + 0.2f * dr;
-                        if (reacquire_cost < best_reacquire_cost)
+                        if (allow_soft_reseed)
                         {
-                            best_reacquire_cost = reacquire_cost;
-                            reacquire_idx = i;
+                            range_penalty *= 0.25f;
+                            velocity_penalty *= 0.1f;
+                            kinematic_penalty = 0.0f;
                         }
                     }
 
-                    if (reacquire_idx >= 0)
+                    const float score =
+                        t.snr_db -
+                        range_penalty * dr -
+                        velocity_penalty * dv -
+                        kinematic_penalty * dv_kin -
+                        cfg_.single_track_abs_velocity_penalty * std::fabs(t.velocity_mps);
+
+                    if (score > best_score)
                     {
-                        best_idx = reacquire_idx;
-                    }
-                    else if (single_track_missed_frames_ < cfg_.single_track_max_missed_frames)
-                    {
-                        single_track_missed_frames_++;
-                        out_targets.clear();
-                        return 0;
+                        best_score = score;
+                        best_idx = i;
                     }
                 }
 
                 if (best_idx < 0)
                 {
-                    best_idx = 0;
-                    for (int i = 1; i < static_cast<int>(out_targets.size()); ++i)
+                    if (single_track_initialized_)
                     {
-                        if (out_targets[i].snr_db > out_targets[best_idx].snr_db ||
-                            (out_targets[i].snr_db == out_targets[best_idx].snr_db &&
-                             out_targets[i].power > out_targets[best_idx].power))
+                        int reacquire_idx = -1;
+                        float best_reacquire_cost = std::numeric_limits<float>::infinity();
+                        for (int i = 0; i < static_cast<int>(out_targets.size()); ++i)
                         {
-                            best_idx = i;
+                            const auto &t = out_targets[i];
+                            if (t.snr_db < frame_snr_max - cfg_.single_track_snr_near_max_db)
+                            {
+                                continue;
+                            }
+
+                            const float dr = std::fabs(t.range_m - single_track_last_.range_m);
+                            const float dv = std::fabs(t.velocity_mps - single_track_last_.velocity_mps);
+                            if (dv > cfg_.single_track_reacquire_max_velocity_jump_mps)
+                            {
+                                continue;
+                            }
+
+                            const float reacquire_cost = dv + 0.2f * dr;
+                            if (reacquire_cost < best_reacquire_cost)
+                            {
+                                best_reacquire_cost = reacquire_cost;
+                                reacquire_idx = i;
+                            }
+                        }
+
+                        if (reacquire_idx >= 0)
+                        {
+                            best_idx = reacquire_idx;
+                        }
+                        else if (single_track_missed_frames_ < cfg_.single_track_max_missed_frames)
+                        {
+                            single_track_missed_frames_++;
+                            out_targets.clear();
+                            output_empty = true;
+                        }
+                    }
+
+                    if (!output_empty && best_idx < 0)
+                    {
+                        best_idx = 0;
+                        for (int i = 1; i < static_cast<int>(out_targets.size()); ++i)
+                        {
+                            if (out_targets[i].snr_db > out_targets[best_idx].snr_db ||
+                                (out_targets[i].snr_db == out_targets[best_idx].snr_db &&
+                                 out_targets[i].power > out_targets[best_idx].power))
+                            {
+                                best_idx = i;
+                            }
                         }
                     }
                 }
+
+                if (!output_empty)
+                {
+                    const RadarTarget selected = out_targets[best_idx];
+                    out_targets.clear();
+                    out_targets.push_back(selected);
+
+                    single_track_last_ = selected;
+                    single_track_initialized_ = true;
+                    single_track_missed_frames_ = 0;
+                }
             }
-
-            const RadarTarget selected = out_targets[best_idx];
-            out_targets.clear();
-            out_targets.push_back(selected);
-
-            single_track_last_ = selected;
-            single_track_initialized_ = true;
-            single_track_missed_frames_ = 0;
         }
 
         return static_cast<int>(out_targets.size());

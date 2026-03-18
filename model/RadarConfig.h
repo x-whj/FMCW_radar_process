@@ -8,20 +8,18 @@ namespace radar
 
     struct RadarConfig
     {
-        // ---------- 维度定义 ----------
-        // num_chirps: 一帧内慢时间长度（决定 Doppler bin 数）
-        // num_samples: 每个 chirp 的快时间采样点（决定 Range bin 数）
+       
         int num_channels = 3; // 1 sum + 1 az diff + 1 el diff
         int num_chirps = 256;
         int num_samples = 664;
 
         int cfar_window = 17; // 必须为奇数
         int cfar_guard = 2;
-        float cfar_pfa = 1e-5f;             // 预留
-        float cfar_threshold_scale = 12.0f; // 先保留经验值，后续可替换为理论门限系数
+        float cfar_pfa = 1e-5f;             
+        float cfar_threshold_scale = 12.0f; // 先保留经验值
         int max_targets = 256;
 
-        // CFAR v2 tuning parameters
+       
         int cfar_train_x = 8;
         int cfar_train_y = 6;
         int cfar_guard_x = 2;
@@ -33,26 +31,24 @@ namespace radar
         float cfar_min_cut_power = 0.0f;
         float cfar_peak_min_snr_db = 12.0f;
 
-        // Host-side post-filter and output control
+       
         float post_min_range_m = 0.0f;
         float post_min_snr_db = 0.0f;
         float post_max_abs_vel_mps = 100.0f;
         int post_top_k = 0; // 0: keep all
-        // Suppress strip-like clutter lines: if a centered Doppler bin has too many points,
-        // keep only strongest K points in that bin.
+      
         bool post_doppler_line_suppress_enable = false;
         int post_doppler_line_min_points = 6;
         int post_doppler_line_keep_per_bin = 1;
 
-        // DBSCAN clustering on (range, doppler) candidate points
+       
         bool dbscan_enable = true;
         float dbscan_eps_range_m = 0.45f;
         float dbscan_eps_velocity_mps = 1.2f;
         int dbscan_min_points = 2;
         bool dbscan_keep_noise = true;
-        int dbscan_max_clusters = 0; // 0: keep all clusters, >0: keep strongest K clusters
+        int dbscan_max_clusters = 0;
 
-        // Multi-target tracker parameters.
         bool tracking_enable = true;
         float tracking_frame_dt_s = 0.1f;
         float tracking_gate_range_m = 1.2f;
@@ -72,7 +68,7 @@ namespace radar
         float tracking_spawn_exclusion_range_m = 0.0f;
         float tracking_spawn_exclusion_velocity_mps = 0.0f;
 
-        // Optional temporal selection for single-target scenes.
+       
         bool single_target_mode = true;
         float single_track_gate_range_m = 1.5f;
         float single_track_gate_velocity_mps = 6.0f;
@@ -89,7 +85,6 @@ namespace radar
         // ---------- bin 到物理量的换算 ----------
         // range_m ~= range_bin * range_resolution_m
         // velocity_mps ~= doppler_bin_centered * velocity_resolution_mps
-        // 注意：当前 velocity_resolution_mps 是工程标定值，不是自动从波形参数实时反推。
         float range_resolution_m = 0.15f;
         float velocity_resolution_mps = 0.2f;
 
@@ -98,7 +93,9 @@ namespace radar
         int socket_rcvbuf_bytes = 32 * 1024 * 1024;
 
         int ring_slots = 3;
-        bool prefer_mapped_zero_copy = true; // true: kernel 直接读 mapped host；false: 先 memcpyAsync 到 device
+        bool prefer_mapped_zero_copy = false; // false: 先 memcpyAsync 到 device；true: kernel 直接读 mapped host
+        bool debug_dump_power_map = false;
+        bool verbose_frame_logs = false;
         //算出一整帧原始UDP pay load总共有字节数
         std::size_t frame_payload_bytes() const
         {
