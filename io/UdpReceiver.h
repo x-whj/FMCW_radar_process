@@ -1,13 +1,16 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <thread>
 #include <vector>
+
 #include "io/FrameAssembler.h"
 #include "io/RingBuffer.h"
 #include "model/RadarConfig.h"
 #include "runtime/Logger.h"
 #include "runtime/Metrics.h"
+
 namespace radar
 {
     struct RxFrameSlot

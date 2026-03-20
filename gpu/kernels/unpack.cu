@@ -8,12 +8,15 @@ namespace radar
     // Slow-time window, loaded once from host
     __constant__ float k_slow_time_window[256];
 
-    // Raw payload layout for each (chirp, sample):
-    // [ch0_I, ch0_Q, ch1_I, ch1_Q, ch2_I, ch2_Q]
+    // Raw CPI payload layout:
+    // [chirp][channel][sample][Q,I]
     // where:
     // ch0 -> sum channel Sigma
     // ch1 -> azimuth difference Delta_az
     // ch2 -> elevation difference Delta_el
+    //
+    // 文档规定单个采样点的 32-bit 小端排列等价于接收端按 16-bit 读取后得到 [Q, I]，
+    // 所以这里需要在写入 float2 时交换成 (I, Q)。
     //
     // Output cube layout:
     // [channel][chirp][sample]
@@ -34,16 +37,19 @@ namespace radar
         }
 
         const int plane = num_chirps * num_samples;
-        const int raw_base = (chirp * num_samples + sample) * (num_channels * 2);
+        const int channel_stride = num_samples * 2;
+        const int chirp_stride = num_channels * channel_stride;
+        const int chirp_base = chirp * chirp_stride;
         const float w = k_slow_time_window[chirp];
 
         for (int ch = 0; ch < num_channels; ++ch)
         {
-            const int raw_idx = raw_base + ch * 2;
+            const int raw_idx = chirp_base + ch * channel_stride + sample * 2;
             const int cube_idx = ch * plane + chirp * num_samples + sample;
 
-            const float i = static_cast<float>(raw[raw_idx + 0]);
-            const float q = static_cast<float>(raw[raw_idx + 1]);
+            // Wire order is [Q, I]; convert back to the float2 convention (I, Q).
+            const float q = static_cast<float>(raw[raw_idx + 0]);
+            const float i = static_cast<float>(raw[raw_idx + 1]);
 
             cube[cube_idx] = make_float2(i * w, q * w);
         }
@@ -64,16 +70,19 @@ namespace radar
         }
 
         const int plane = num_chirps * num_samples;
+        const int channel_stride = num_samples * 2;
+        const int chirp_stride = channel_stride * 3;
         const int idx = chirp * num_samples + sample;
-        const int raw_base = idx * 6;
+        const int sample_base = chirp * chirp_stride + sample * 2;
         const float w = k_slow_time_window[chirp];
 
-        cube[idx] = make_float2(static_cast<float>(raw[raw_base + 0]) * w,
-                                static_cast<float>(raw[raw_base + 1]) * w);
-        cube[plane + idx] = make_float2(static_cast<float>(raw[raw_base + 2]) * w,
-                                        static_cast<float>(raw[raw_base + 3]) * w);
-        cube[2 * plane + idx] = make_float2(static_cast<float>(raw[raw_base + 4]) * w,
-                                            static_cast<float>(raw[raw_base + 5]) * w);
+        // ch0/ch1/ch2 each store [Q, I] for the same sample index inside their own plane.
+        cube[idx] = make_float2(static_cast<float>(raw[sample_base + 1]) * w,
+                                static_cast<float>(raw[sample_base + 0]) * w);
+        cube[plane + idx] = make_float2(static_cast<float>(raw[sample_base + channel_stride + 1]) * w,
+                                        static_cast<float>(raw[sample_base + channel_stride + 0]) * w);
+        cube[2 * plane + idx] = make_float2(static_cast<float>(raw[sample_base + 2 * channel_stride + 1]) * w,
+                                            static_cast<float>(raw[sample_base + 2 * channel_stride + 0]) * w);
     }
 
     void upload_slow_time_window(const float *h_window, int count)

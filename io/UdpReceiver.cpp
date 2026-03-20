@@ -53,7 +53,7 @@ namespace radar
     void UdpReceiver<N>::run()
     {
         std::vector<uint8_t> udp_buf(cfg_.mtu_bytes);
-        FrameAssembler assembler;
+        FrameAssembler assembler(cfg_);
         std::optional<std::size_t> filling_slot = ring_.acquire_free_slot();
         if (!filling_slot.has_value())
         {
@@ -68,21 +68,12 @@ namespace radar
             if (n <= 0)
                 continue;
             metrics_.udp_packets_rx.fetch_add(1, std::memory_order_relaxed);
-            if (n < static_cast<int>(sizeof(FpgaUdpHeader)))
-            {
-                metrics_.udp_packets_drop.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            auto *hdr = reinterpret_cast<const FpgaUdpHeader *>(udp_buf.data());
-            const uint8_t *payload = udp_buf.data() + sizeof(FpgaUdpHeader);
-            const int payload_bytes = n - static_cast<int>(sizeof(FpgaUdpHeader));
-            if (hdr->payload_len != static_cast<uint32_t>(payload_bytes))
-            {
-                metrics_.udp_packets_drop.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            auto st = assembler.push_packet(*hdr,
-                                            payload,
+
+            // The document format no longer uses a custom per-UDP software header.
+            // recvfrom() returns one UDP payload chunk from the raw PRT byte stream,
+            // and FrameAssembler is responsible for finding PRT boundaries inside it.
+            auto st = assembler.push_packet(udp_buf.data(),
+                                            static_cast<std::size_t>(n),
                                             slots_[*filling_slot].mapped_host,
                                             cfg_.frame_payload_bytes());
             if (st.packet_invalid)
@@ -97,7 +88,7 @@ namespace radar
             }
             if (st.frame_completed)
             {
-                slots_[*filling_slot].frame_id = hdr->frame_id;
+                slots_[*filling_slot].frame_id = assembler.current_frame_id();
                 ring_.mark_ready(*filling_slot);
                 metrics_.frames_completed.fetch_add(1, std::memory_order_relaxed);
                 auto next = ring_.acquire_free_slot();

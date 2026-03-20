@@ -8,6 +8,9 @@ namespace radar
 
     struct RadarConfig
     {
+        static constexpr std::size_t kPrtHeaderBytes = 256;
+        static constexpr std::uint32_t kPrtFixedHeader = 0xAA55CD32u;
+
        
         int num_channels = 3; // 1 sum + 1 az diff + 1 el diff
         int num_chirps = 256;
@@ -89,6 +92,7 @@ namespace radar
         float velocity_resolution_mps = 0.2f;
 
         int udp_port = 8080;
+        int udp_payload_bytes = 1464;
         int mtu_bytes = 9000;
         int socket_rcvbuf_bytes = 32 * 1024 * 1024;
 
@@ -96,14 +100,25 @@ namespace radar
         bool prefer_mapped_zero_copy = false; // false: 先 memcpyAsync 到 device；true: kernel 直接读 mapped host
         bool debug_dump_power_map = false;
         bool verbose_frame_logs = false;
-        //算出一整帧原始UDP pay load总共有字节数
-        std::size_t frame_payload_bytes() const
+        // 单个 PRT 数据区大小（不含 256 B PRT 头）：
+        // [channel][sample][Q,I]，其中 channel 顺序为 sum/az/el
+        std::size_t prt_data_bytes() const
         {
-            // raw payload: [channel][I/Q] => int16 interleaved
             return static_cast<std::size_t>(num_channels) *
-                   static_cast<std::size_t>(num_chirps) *
                    static_cast<std::size_t>(num_samples) *
                    2ULL * sizeof(int16_t);
+        }
+
+        std::size_t prt_total_bytes() const
+        {
+            return kPrtHeaderBytes + prt_data_bytes();
+        }
+
+        // 一整帧 CPI 原始数据区大小（不含各 PRT 头）：
+        // [chirp][channel][sample][Q,I]
+        std::size_t frame_payload_bytes() const
+        {
+            return static_cast<std::size_t>(num_chirps) * prt_data_bytes();
         }
 
         std::size_t cube_complex_count() const
