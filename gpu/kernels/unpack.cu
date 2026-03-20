@@ -5,20 +5,20 @@
 namespace radar
 {
 
-    // Slow-time window, loaded once from host
+    // 慢时间窗，由主机侧一次性上传到常量内存
     __constant__ float k_slow_time_window[256];
 
-    // Raw CPI payload layout:
+    // 原始 CPI 数据区布局：
     // [chirp][channel][sample][Q,I]
-    // where:
-    // ch0 -> sum channel Sigma
-    // ch1 -> azimuth difference Delta_az
-    // ch2 -> elevation difference Delta_el
+    // 其中：
+    // ch0 -> 和通道 Sigma
+    // ch1 -> 方位差通道 Delta_az
+    // ch2 -> 俯仰差通道 Delta_el
     //
     // 文档规定单个采样点的 32-bit 小端排列等价于接收端按 16-bit 读取后得到 [Q, I]，
     // 所以这里需要在写入 float2 时交换成 (I, Q)。
     //
-    // Output cube layout:
+    // 输出立方体布局：
     // [channel][chirp][sample]
 
     __global__ void unpack_and_window_kernel(
@@ -47,7 +47,7 @@ namespace radar
             const int raw_idx = chirp_base + ch * channel_stride + sample * 2;
             const int cube_idx = ch * plane + chirp * num_samples + sample;
 
-            // Wire order is [Q, I]; convert back to the float2 convention (I, Q).
+            // 线上的顺序是 [Q, I]，这里恢复成算法内部统一使用的 (I, Q)。
             const float q = static_cast<float>(raw[raw_idx + 0]);
             const float i = static_cast<float>(raw[raw_idx + 1]);
 
@@ -76,7 +76,7 @@ namespace radar
         const int sample_base = chirp * chirp_stride + sample * 2;
         const float w = k_slow_time_window[chirp];
 
-        // ch0/ch1/ch2 each store [Q, I] for the same sample index inside their own plane.
+        // ch0/ch1/ch2 三个通道各自的平面内都按 [Q, I] 存放同一个 sample。
         cube[idx] = make_float2(static_cast<float>(raw[sample_base + 1]) * w,
                                 static_cast<float>(raw[sample_base + 0]) * w);
         cube[plane + idx] = make_float2(static_cast<float>(raw[sample_base + channel_stride + 1]) * w,

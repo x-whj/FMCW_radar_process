@@ -69,9 +69,9 @@ namespace radar
                 continue;
             metrics_.udp_packets_rx.fetch_add(1, std::memory_order_relaxed);
 
-            // The document format no longer uses a custom per-UDP software header.
-            // recvfrom() returns one UDP payload chunk from the raw PRT byte stream,
-            // and FrameAssembler is responsible for finding PRT boundaries inside it.
+            // 文档格式不再使用自定义的软件 UDP 头。
+            // recvfrom() 拿到的是原始 PRT 字节流中的一个 UDP payload 分片，
+            // 由 FrameAssembler 在这些分片里自行识别 PRT 边界并组装 CPI。
             auto st = assembler.push_packet(udp_buf.data(),
                                             static_cast<std::size_t>(n),
                                             slots_[*filling_slot].mapped_host,

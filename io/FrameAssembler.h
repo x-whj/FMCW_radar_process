@@ -49,8 +49,8 @@ namespace radar
             {
                 if (!prt_header_parsed_)
                 {
-                    // UDP packets are treated as a continuous byte stream.
-                    // Search that stream for the next valid PRT header.
+                    // 把 UDP payload 视为连续字节流，
+                    // 在这段字节流里查找下一个合法的 PRT 帧头。
                     resync_to_prt_head();
                     if (prt_buffer_.size() < RadarConfig::kPrtHeaderBytes)
                     {
@@ -71,7 +71,7 @@ namespace radar
 
                 if (prt_buffer_.size() < prt_padded_bytes_)
                 {
-                    // A full PRT has not arrived yet; keep buffering.
+                    // 当前还没收齐一个完整的 PRT，继续缓存后续 UDP 数据。
                     break;
                 }
 
@@ -194,8 +194,8 @@ namespace radar
             pending_prt_.data_type = static_cast<uint16_t>(data_info >> 16);
             pending_prt_.data_format_bits = static_cast<uint16_t>(data_info & 0xFFFFu);
 
-            // At this stage we only accept the subset of the protocol that matches
-            // the current pipeline: fixed sample count, int16 complex IQ payload.
+            // 当前只接受和现有处理链一致的协议子集：
+            // 固定采样点数、int16 复数 IQ 数据。
             if (pending_prt_.prt_samples != static_cast<uint16_t>(cfg_.num_samples))
             {
                 return false;
@@ -272,9 +272,9 @@ namespace radar
                 return st;
             }
 
-            // The GPU expects one CPI payload laid out as:
+            // GPU 期望拿到的整帧 CPI 数据区布局是：
             // [chirp/PRT][channel][sample][Q,I]
-            // so each complete PRT data area is copied into the slot selected by PRT_Num.
+            // 因此这里把每个完整 PRT 的数据区拷贝到由 PRT_Num 指定的位置上。
             std::memcpy(dst_frame + dst_offset,
                         prt_buffer_.data() + RadarConfig::kPrtHeaderBytes,
                         prt_data_bytes);
