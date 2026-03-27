@@ -1,21 +1,66 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cstdint>
 
 namespace radar
 {
 
-    __global__ void sum_channel_power_kernel(
+    __global__ void zero_doppler_notch_kernel(
+        float *__restrict__ power_map,
+        int width,
+        int height,
+        int notch_bins)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = width * height;
+        if (idx >= total)
+            return;
+
+        const int y = idx / width;
+        if (y < notch_bins || y >= height - notch_bins)
+        {
+            power_map[idx] = 0.0f;
+        }
+    }
+
+    __global__ void sum_channel_power_kernel_scalar(
         const float2 *__restrict__ cube,
         float *__restrict__ power_map,
         int sum_channel,
         int elements_per_channel)
     {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= elements_per_channel)
             return;
 
         const float2 v = cube[sum_channel * elements_per_channel + idx];
-        power_map[idx] = v.x * v.x + v.y * v.y;
+        power_map[idx] = __fmaf_rn(v.x, v.x, v.y * v.y);
+    }
+
+    __global__ void sum_channel_power_kernel_f32x2(
+        const float2 *__restrict__ cube,
+        float *__restrict__ power_map,
+        int sum_channel,
+        int elements_per_channel)
+    {
+        const int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+        const float2 *sum_ptr = cube + sum_channel * elements_per_channel;
+
+        if (idx + 1 < elements_per_channel)
+        {
+            const float4 v = reinterpret_cast<const float4 *>(sum_ptr)[idx / 2];
+            float2 out;
+            out.x = __fmaf_rn(v.x, v.x, v.y * v.y);
+            out.y = __fmaf_rn(v.z, v.z, v.w * v.w);
+            reinterpret_cast<float2 *>(power_map)[idx / 2] = out;
+            return;
+        }
+
+        if (idx < elements_per_channel)
+        {
+            const float2 v = sum_ptr[idx];
+            power_map[idx] = __fmaf_rn(v.x, v.x, v.y * v.y);
+        }
     }
 
     void launch_sum_channel_power(
@@ -25,9 +70,49 @@ namespace radar
         int sum_channel,
         int elements_per_channel)
     {
-        int threads = 256;
-        int blocks = (elements_per_channel + threads - 1) / threads;
-        sum_channel_power_kernel<<<blocks, threads, 0, stream>>>(cube, power_map, sum_channel, elements_per_channel);
+        constexpr int threads = 256;
+        const std::uintptr_t sum_ptr_addr =
+            reinterpret_cast<std::uintptr_t>(cube + sum_channel * elements_per_channel);
+        const bool aligned_for_f32x2 =
+            (sum_ptr_addr % alignof(float4) == 0) &&
+            (reinterpret_cast<std::uintptr_t>(power_map) % alignof(float2) == 0);
+
+        if (aligned_for_f32x2)
+        {
+            const int blocks = (elements_per_channel + threads * 2 - 1) / (threads * 2);
+            sum_channel_power_kernel_f32x2<<<blocks, threads, 0, stream>>>(
+                cube, power_map, sum_channel, elements_per_channel);
+            return;
+        }
+
+        const int blocks = (elements_per_channel + threads - 1) / threads;
+        sum_channel_power_kernel_scalar<<<blocks, threads, 0, stream>>>(
+            cube, power_map, sum_channel, elements_per_channel);
+    }
+
+    void launch_zero_doppler_notch(
+        cudaStream_t stream,
+        float *power_map,
+        int width,
+        int height,
+        int notch_bins)
+    {
+        if (power_map == nullptr || width <= 0 || height <= 0 || notch_bins <= 0)
+        {
+            return;
+        }
+
+        const int clamped_bins = min(notch_bins, height / 2);
+        if (clamped_bins <= 0)
+        {
+            return;
+        }
+
+        constexpr int threads = 256;
+        const int total = width * height;
+        const int blocks = (total + threads - 1) / threads;
+        zero_doppler_notch_kernel<<<blocks, threads, 0, stream>>>(
+            power_map, width, height, clamped_bins);
     }
 
 } // namespace radar
