@@ -6,6 +6,7 @@
 #include "gpu/fft/DopplerPlan.h"
 #include "model/Calibration.h"
 #include "model/ChannelMap.h"
+#include "model/FrameMetadata.h"
 #include "model/RadarConfig.h"
 #include "model/TargetTypes.h"
 
@@ -38,7 +39,9 @@ namespace radar
 
         void initialize(const float *h_window_256);
 
-        int process_frame(const int16_t *d_or_mapped_raw, std::vector<RadarTarget> &out_targets);
+        int process_frame(const int16_t *d_or_mapped_raw,
+                          std::vector<RadarTarget> &out_targets,
+                          const FrameRuntimeConfig *runtime = nullptr);
         void print_signal_timing_summary() const;
         const SignalTimingSummary &signal_timing_summary() const { return signal_timing_summary_; }
 

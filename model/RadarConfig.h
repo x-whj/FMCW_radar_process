@@ -10,6 +10,7 @@ namespace radar
     {
         static constexpr std::size_t kPrtHeaderBytes = 256;
         static constexpr std::uint32_t kPrtFixedHeader = 0xAA55CD32u;
+        static constexpr float kLightSpeedMps = 299792458.0f;
 
        
         int num_channels = 3; // 1 sum + 1 az diff + 1 el diff
@@ -18,8 +19,7 @@ namespace radar
 
         int cfar_window = 17; // 必须为奇数
         int cfar_guard = 2;
-        float cfar_pfa = 1e-5f;             
-        float cfar_threshold_scale = 12.0f; // 先保留经验值
+        float cfar_pfa = 1e-5f;
         int max_targets = 256;
 
        
@@ -85,11 +85,25 @@ namespace radar
         float single_track_reacquire_max_velocity_jump_mps = 7.0f;
         int single_track_max_missed_frames = 2;
 
+        // ---------- 波形物理参数 ----------
+        // 当前按老师给定的实际参数设置：
+        // fc = 28.2 GHz, B = 20 MHz, PRT = 51 us
+        float carrier_frequency_hz = 28.2e9f;
+        float waveform_bandwidth_hz = 20.0e6f;
+        float prt_s = 51.0e-6f;
+
         // ---------- bin 到物理量的换算 ----------
         // range_m ~= range_bin * range_resolution_m
         // velocity_mps ~= doppler_bin_centered * velocity_resolution_mps
-        float range_resolution_m = 0.15f;
-        float velocity_resolution_mps = 0.2f;
+        //
+        // 这里默认按脉压带宽和 PRT 推导：
+        // range_resolution_m = c / (2B)
+        // velocity_resolution_mps = lambda / (2 * num_chirps * PRT)
+        //
+        // 若后续老师确认“664 个 sample 的真实距离门间隔”与 c/(2B) 不同，
+        // 再把这两个默认值改为协议/系统真实标定值。
+        float range_resolution_m = 299792458.0f / (2.0f * 20.0e6f);
+        float velocity_resolution_mps = (299792458.0f / 28.2e9f) / (2.0f * 256.0f * 51.0e-6f);
 
         int udp_port = 8080;
         int udp_payload_bytes = 1464;
@@ -99,7 +113,36 @@ namespace radar
         int ring_slots = 3;
         bool prefer_mapped_zero_copy = false; // false: 先 memcpyAsync 到 device；true: kernel 直接读 mapped host
         bool debug_dump_power_map = false;
+        bool debug_print_power_stats = false;
         bool verbose_frame_logs = false;
+        int protocol_prt_start_num = 1;
+        int protocol_prts_per_cpi = 261;
+
+        int protocol_prt_last_num() const
+        {
+            return protocol_prt_start_num + protocol_prts_per_cpi - 1;
+        }
+
+        int active_prt_first_num() const
+        {
+            return protocol_prt_start_num;
+        }
+
+        int active_prt_last_num() const
+        {
+            return protocol_prt_start_num + num_chirps - 1;
+        }
+
+        bool protocol_prt_num_in_range(int prt_num) const
+        {
+            return prt_num >= protocol_prt_start_num && prt_num <= protocol_prt_last_num();
+        }
+
+        bool active_prt_num_in_range(int prt_num) const
+        {
+            return prt_num >= active_prt_first_num() && prt_num <= active_prt_last_num();
+        }
+
         // 单个 PRT 数据区大小（不含 256 B PRT 头）：
         // [channel][sample][Q,I]，其中 channel 顺序为 sum/az/el
         std::size_t prt_data_bytes() const
@@ -143,6 +186,26 @@ namespace radar
         std::size_t rd_map_bytes() const
         {
             return rd_map_elements() * sizeof(float);
+        }
+
+        float wavelength_m() const
+        {
+            return kLightSpeedMps / carrier_frequency_hz;
+        }
+
+        float nominal_range_resolution_m() const
+        {
+            return kLightSpeedMps / (2.0f * waveform_bandwidth_hz);
+        }
+
+        float nominal_velocity_resolution_mps() const
+        {
+            return wavelength_m() / (2.0f * static_cast<float>(num_chirps) * prt_s);
+        }
+
+        float nominal_max_abs_velocity_mps() const
+        {
+            return wavelength_m() / (4.0f * prt_s);
         }
     };
 

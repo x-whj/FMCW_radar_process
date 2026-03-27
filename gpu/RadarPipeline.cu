@@ -465,7 +465,8 @@ namespace radar
     }
 
     int RadarPipeline::process_frame(const int16_t *d_or_mapped_raw,
-                                     std::vector<RadarTarget> &out_targets)
+                                     std::vector<RadarTarget> &out_targets,
+                                     const FrameRuntimeConfig *runtime)
     {
         // 一帧主流程（建议按以下阶段读代码）：
         // 1 清理计数与中间缓冲
@@ -479,6 +480,24 @@ namespace radar
         // 9~16 主机侧后处理（过滤/聚类/Doppler线抑制/top-k/单目标时序选择）
         const int plane = cfg_.num_chirps * cfg_.num_samples;
         static int s_dump_frame_index = 0;
+        MonopulseCalibration frame_calib = calib_;
+        float cfar_peak_min_snr_db = cfg_.cfar_peak_min_snr_db;
+
+        if (runtime)
+        {
+            if (runtime->has_beam_azimuth)
+            {
+                frame_calib.az_bias += runtime->beam_azimuth_deg;
+            }
+            if (runtime->has_beam_elevation)
+            {
+                frame_calib.el_bias += runtime->beam_elevation_deg;
+            }
+            if (runtime->cfar_peak_min_snr_db > 0.0f)
+            {
+                cfar_peak_min_snr_db = runtime->cfar_peak_min_snr_db;
+            }
+        }
 
         enum TimingEventIndex
         {
@@ -550,10 +569,11 @@ namespace radar
                                  buffers_.d_power_map,
                                  chmap_.sum_primary,
                                  plane);
+
         record_timing_event(kEvtAfterSumPower);
 
         // Stage 6: 调试导出功率图，便于和 Matlab 逐帧对齐
-        if (cfg_.debug_dump_power_map)
+        if (cfg_.debug_dump_power_map || cfg_.debug_print_power_stats)
         {
             std::vector<float> h_power_map(cfg_.rd_map_elements());
 
@@ -565,11 +585,63 @@ namespace radar
 
             CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-            dump_power_map_to_file(h_power_map.data(),
-                                   cfg_.num_chirps,
-                                   cfg_.num_samples,
-                                   s_dump_frame_index);
-            ++s_dump_frame_index;
+            if (cfg_.debug_dump_power_map)
+            {
+                dump_power_map_to_file(h_power_map.data(),
+                                       cfg_.num_chirps,
+                                       cfg_.num_samples,
+                                       s_dump_frame_index);
+                ++s_dump_frame_index;
+            }
+
+            if (cfg_.debug_print_power_stats)
+            {
+                double sum = 0.0;
+                float min_value = std::numeric_limits<float>::infinity();
+                float max_value = -std::numeric_limits<float>::infinity();
+                std::size_t max_index = 0;
+                std::size_t positive_count = 0;
+                std::size_t nonfinite_count = 0;
+
+                for (std::size_t idx = 0; idx < h_power_map.size(); ++idx)
+                {
+                    const float v = h_power_map[idx];
+                    if (!std::isfinite(v))
+                    {
+                        ++nonfinite_count;
+                        continue;
+                    }
+
+                    sum += static_cast<double>(v);
+                    if (v < min_value)
+                    {
+                        min_value = v;
+                    }
+                    if (v > max_value)
+                    {
+                        max_value = v;
+                        max_index = idx;
+                    }
+                    if (v > 0.0f)
+                    {
+                        ++positive_count;
+                    }
+                }
+
+                const double mean_value =
+                    h_power_map.empty() ? 0.0 : (sum / static_cast<double>(h_power_map.size()));
+                const int max_doppler = static_cast<int>(max_index / static_cast<std::size_t>(cfg_.num_samples));
+                const int max_range = static_cast<int>(max_index % static_cast<std::size_t>(cfg_.num_samples));
+
+                std::cout << "[Power] min=" << min_value
+                          << " max=" << max_value
+                          << " mean=" << mean_value
+                          << " max_bin=(" << max_doppler << "," << max_range << ")"
+                          << " positive=" << positive_count
+                          << "/" << h_power_map.size()
+                          << " nonfinite=" << nonfinite_count
+                          << std::endl;
+            }
         }
 
         // Stage 7: CFAR 命中 + NMS 峰值提取（得到目标候选 bin）
@@ -594,7 +666,7 @@ namespace radar
                                         cfg_.cfar_near_range_suppress_bins,
                                         cfg_.cfar_zero_doppler_suppress_bins,
                                         cfg_.cfar_peak_half_window,
-                                        cfg_.cfar_peak_min_snr_db,
+                                        cfar_peak_min_snr_db,
                                         cfg_.max_targets,
                                         cfg_.verbose_frame_logs);
         record_timing_event(kEvtAfterCfarPeak);
@@ -608,7 +680,7 @@ namespace radar
                          cfg_.max_targets,
                          cfg_,
                          chmap_,
-                         calib_);
+                         frame_calib);
         record_timing_event(kEvtAfterMonopulse);
 
         // Stage 9: 拷回命中数/峰值数，供日志和后处理使用

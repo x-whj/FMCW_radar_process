@@ -1,44 +1,215 @@
-# FMCW 雷达 GPU 处理流水线（多目标追踪）
+# 雷达离线处理工程说明
 
 ## 1. 项目概述
 
-本项目实现了一套基于 CUDA 的 FMCW 雷达处理链，支持离线回放与后续在线集成。
+本项目是一套基于 C++ / CUDA 的雷达离线处理工程，当前重点支持两类输入：
 
-当前端到端流程：
+- 三个通道的离线 IQ 文件回放
+- 原始抓包 `.dat` 文件回放
 
-1. 读取多通道 IQ 原始数据。
-2. GPU 执行 unpack + 慢时间加窗。
-3. 各通道执行 Doppler FFT。
-4. 生成和通道 RD 功率图。
-5. 在 RD 图上执行 CFAR + NMS 峰值提取。
-6. 对候选点做比幅测角与距离/速度估计。
-7. 主机侧后处理：
-   - 基础阈值过滤
-   - DBSCAN 候选合并
-   - 可选的 Doppler 线杂波抑制
-8. 多目标追踪（Kalman + 门控关联 + 轨迹生命周期）。
-9. 将轨迹输出到 CSV。
+当前主流程是：
 
-可执行文件：`radar_app`
+1. 组帧得到一个完整 CPI
+2. GPU 解包并施加慢时间窗
+3. 对每个通道做 Doppler FFT
+4. 用和通道生成功率图
+5. 在功率图上做 2D CA-CFAR + 峰值提取
+6. 用差通道做比幅单脉冲测角
+7. 主机侧做基础过滤、DBSCAN、Doppler 线抑制等后处理
+8. 可选做多目标跟踪
+9. 输出检测点 CSV、轨迹 CSV、功率图 dump
 
-## 2. 目录结构
+注意：
+
+- 当前输入数据已经确认是脉压后的三通道数据
+- 因此当前工程不做 Range FFT
+- 当前 RD 图实际上是“距离门 x Doppler”图
+
+## 2. 可执行程序
+
+当前 CMake 会构建以下三个程序：
+
+- `radar_app`
+- `raw_packet_replay`
+- `udp_offline_verify`
+
+### 2.1 `radar_app`
+
+用途：
+
+- 旧的离线回放入口
+- 从三个 float IQ 文件读取数据
+- 适合快速验证算法主链是否通畅
+
+输入文件固定为当前工作目录下：
+
+- `output_he.dat`
+- `output_cha1.dat`
+- `output_cha2.dat`
+
+其中：
+
+- `output_he.dat`：和通道
+- `output_cha1.dat`：方位差通道
+- `output_cha2.dat`：俯仰差通道
+
+### 2.2 `raw_packet_replay`
+
+用途：
+
+- 当前主要使用的原始抓包离线入口
+- 从 `.dat` 抓包文件中恢复 PRT / CPI
+- 跑完整 GPU 检测链
+- 可导出功率图、检测点 CSV、轨迹 CSV
+
+它比 `radar_app` 更接近真实协议链路。
+
+### 2.3 `udp_offline_verify`
+
+用途：
+
+- 协议/PRT/CPI 级诊断工具
+- 不跑完整 GPU 算法
+- 用于确认：
+  - PRT 头
+  - PRT 跨度
+  - CPI 长度
+  - 波位统计
+  - padding 情况
+
+## 3. 目录结构
 
 ```text
-app/                    # 主程序入口与离线回放循环
+app/
+  main.cpp                  # 三文件离线回放入口 radar_app
+  raw_packet_replay.cpp     # 原始抓包离线回放入口
+  udp_offline_verify.cpp    # 协议诊断工具
+  TuneProfiles.h            # single / multi 两套 profile
+
 gpu/
-  RadarPipeline.cu      # GPU主流程 + 主机侧后处理
-  kernels/              # unpack / power / cfar / monopulse 内核
+  RadarPipeline.cu          # GPU主流程 + 主机侧后处理
+  RadarPipeline.h
+  kernels/
+    unpack.cu               # [chirp][channel][sample][Q,I] -> [channel][chirp][sample]
+    power.cu                # 和通道功率图
+    cfar.cu                 # 2D CA-CFAR + 峰值提取
+    monopulse.cu            # 距离/速度/比幅测角
+
+io/
+  FrameAssembler.h          # 原始抓包字节流 -> PRT -> CPI
+  FrameRuntimeConfigBuilder.h
+  OfflineReplay.h           # 三文件离线回放拼帧
+  PrtProtocol.h             # PRT头解析、波位解码
+  UdpReceiver.*             # 预留在线接收路径
+
 tracking/
-  MultiTargetTracker.*  # 多目标追踪模块
-io/                     # OfflineReplay、UDP接收、组帧
-model/                  # RadarConfig、目标结构、通道映射
-runtime/                # 日志、统计
+  MultiTargetTracker.*      # 多目标跟踪
+
+model/
+  RadarConfig.h
+  FrameMetadata.h
+  Calibration.h
+  ChannelMap.h
+  TargetTypes.h
+
+runtime/
+  Logger.h
+  Metrics.h
+
 matlab/
-  plot_multi_track.m    # 轨迹可视化脚本
-CMakeLists.txt
+  README.md
+  compare_raw_packet_power_map.m
+  inspect_dumped_power_map.m
+  plot_detection_csv.m
+  inspect_detection_frame.m
+  ...
 ```
 
-## 3. 编译
+## 4. 协议与数据格式
+
+### 4.1 原始抓包协议
+
+当前已经确认的协议事实：
+
+- 单个 UDP payload：`1464 bytes`
+- 单个 PRT 总跨度：`8784 bytes = 6 x 1464`
+- 单个 PRT 头：`256 bytes`
+- 单个 PRT 数据区：`7968 bytes`
+- 一个 CPI 的协议 PRT 数：`261`
+- 当前算法实际处理的有效 PRT 数：`256`
+- 最后 5 个 PRT 用于切波位，不进入算法主处理
+
+PRT 编号范围：
+
+- 协议范围：`1 .. 261`
+- 算法处理范围：`1 .. 256`
+
+### 4.2 原始数据布局
+
+单个 PRT 数据区布局：
+
+```text
+[channel][sample][Q,I]
+```
+
+整个 CPI 组装后的原始帧缓冲布局：
+
+```text
+[chirp/PRT][channel][sample][Q,I]
+```
+
+通道顺序固定为：
+
+- `ch0`：和通道 `Sigma`
+- `ch1`：方位差通道 `Delta_az`
+- `ch2`：俯仰差通道 `Delta_el`
+
+线路上的每个复数样点是 `int16`，按接收端 16-bit 小端读取后可视为：
+
+```text
+[Q, I]
+```
+
+GPU `unpack` 阶段会把它恢复为算法内部统一使用的 `(I, Q)`。
+
+### 4.3 GPU 内部布局
+
+`unpack.cu` 之后，GPU 立方体布局为：
+
+```text
+[channel][chirp][sample]
+```
+
+之后沿 `chirp` 维做 Doppler FFT。
+
+和通道功率图可理解为：
+
+```text
+[doppler][range]
+```
+
+## 5. 波位与角度
+
+PRT 头中包含波位角信息。
+
+当前波位角解码公式为：
+
+```text
+(raw_angle - 1000) * 0.05  degree
+```
+
+例如：
+
+- `raw = 1000` 对应 `0 deg`
+
+当前工程里，比幅测角得到的是“相对波束的角误差”，最终输出角度时会把当前波位角加进去，因此导出的：
+
+- `azimuth_deg`
+- `elevation_deg`
+
+表示的是目标相对雷达的最终角度。
+
+## 6. 编译
 
 ```bash
 rm -rf build
@@ -48,218 +219,345 @@ rm -rf build
 /usr/bin/cmake --build build -j$(nproc)
 ```
 
-## 4. 离线回放运行
+默认构建目标：
 
-`radar_app` 会从当前工作目录读取以下文件：
+- `build/radar_app`
+- `build/raw_packet_replay`
+- `build/udp_offline_verify`
 
-- `output_he.dat`（和通道）
-- `output_cha1.dat`（方位差通道）
-- `output_cha2.dat`（俯仰差通道）
+## 7. 运行方式
 
-### 4.1 运行配置档（profile）
-
-支持两套运行参数：
-
-- `single`（默认）：更保守，适合单目标/低杂波场景。
-- `multi`：更宽松，适合多目标场景。
-
-```bash
-cd build
-./radar_app --profile single
-./radar_app --profile multi
-```
+### 7.1 `radar_app`
 
 帮助：
 
 ```bash
-./radar_app --help
+./build/radar_app --help
 ```
 
-终端日志包含：
+支持选项：
 
-- `[CFAR] hits=... peaks=...`
-- `[DBSCAN] in=... clusters=... out=...`
-- `[DOPPLER] in=... suppressed_bins=... out=...`（启用时）
-- `[Offline Frame k] detections=n tracks=m`
-- `[Det] ...` 与 `[Track] ...`
+- `--profile single|multi`
 
-## 5. 输出文件
+示例：
 
-### 5.1 多轨迹 CSV
+```bash
+./build/radar_app --profile single
+./build/radar_app --profile multi
+```
 
-离线运行输出：
+说明：
 
-- `offline_multi_track.csv`
+- `radar_app` 使用固定输入文件名
+- 当前不支持通过 CLI 指定输入文件路径
 
-字段说明：
+### 7.2 `raw_packet_replay`
 
-- `frame`
-- `track_id`（`-1` 表示该帧无输出轨迹）
-- `confirmed`（`1` 已确认，`0` 未确认）
-- `age`（轨迹生命周期，单位帧）
-- `hits`（成功关联次数）
-- `missed`（连续丢失帧数）
+帮助：
+
+```bash
+./build/raw_packet_replay --help
+```
+
+当前支持选项：
+
+- `--file PATH`
+- `--profile single|multi`
+- `--max-frames N`
+- `--payload-bytes N`
+- `--track-csv PATH`
+- `--det-csv PATH`
+- `--quiet`
+- `--power-stats`
+- `--dump-power-map`
+- `--only-zero-beam`
+- `--beam-az-raw N`
+- `--beam-el-raw N`
+- `--cfar-peak-snr-db X`
+- `--post-min-snr-db X`
+
+示例：全量原始抓包回放
+
+```bash
+./build/raw_packet_replay \
+  --file build/output_first_900MB.dat \
+  --profile multi
+```
+
+示例：只跑前 100 帧并导出功率图
+
+```bash
+./build/raw_packet_replay \
+  --file build/26_03_19_11_37_37.dat \
+  --profile multi \
+  --max-frames 100 \
+  --power-stats \
+  --dump-power-map
+```
+
+示例：只分析 `0/0` 波位
+
+```bash
+./build/raw_packet_replay \
+  --file build/26_03_19_11_37_37.dat \
+  --profile multi \
+  --only-zero-beam \
+  --det-csv zero_beam_det.csv \
+  --track-csv zero_beam_track.csv
+```
+
+示例：显式指定原始波位
+
+```bash
+./build/raw_packet_replay \
+  --file build/26_03_19_11_37_37.dat \
+  --profile multi \
+  --beam-az-raw 1000 \
+  --beam-el-raw 1000
+```
+
+### 7.3 `udp_offline_verify`
+
+帮助：
+
+```bash
+./build/udp_offline_verify --help
+```
+
+当前支持选项：
+
+- `--file PATH`
+- `--payload-bytes N`
+- `--scan-bytes N`
+- `--max-cpi N`
+- `--preview-cpi N`
+- `--inspect-prt N`
+- `--inspect-bytes N`
+
+典型用途：
+
+- 推断 PRT 跨度
+- 统计 CPI
+- 检查波位分布
+- 核对 padding
+
+## 8. `--profile` 说明
+
+工程目前统一使用 `app/TuneProfiles.h` 中的两套 profile：
+
+- `single`
+- `multi`
+
+### 8.1 `single`
+
+用途：
+
+- 更保守
+- 适合单目标、低杂波、先求稳的场景
+
+主要特点：
+
+- `cfar_peak_min_snr_db` 更高
+- `post_min_snr_db` 更高
+- 跟踪门控更紧
+- 输出轨迹确认条件更严格
+
+### 8.2 `multi`
+
+用途：
+
+- 更宽松
+- 适合多目标或需要先把点“放出来”的场景
+
+主要特点：
+
+- `cfar_peak_min_snr_db` 更低
+- `post_min_snr_db` 更低
+- 速度范围更宽
+- DBSCAN 半径更紧，但检测保留更积极
+
+### 8.3 一个很重要的细节
+
+`raw_packet_replay` 在 `multi` profile 上还会额外做一次“原始抓包 bring-up 放宽”：
+
+- `cfar_peak_min_snr_db = 8.0`
+- `post_min_snr_db = 6.0`
+- `tracking_spawn_min_snr_db = 8.0`
+
+这一步只发生在 `raw_packet_replay`，目的是：
+
+- 先确认原始协议接入后能否正常出点
+- 不让抓包接入初期因为门限过严而误判“算法没工作”
+
+所以：
+
+- `radar_app --profile multi`
+- `raw_packet_replay --profile multi`
+
+两者不是完全同一套最终门限。
+
+## 9. 当前 CFAR 语义
+
+当前已经明确收口为：
+
+```text
+threshold = alpha * noise
+```
+
+也就是说：
+
+- 当前真正影响 CFAR 的核心参数是 `cfar_pfa`
+- CLI 层主要暴露的是 `--cfar-peak-snr-db`
+- 旧的 `cfar_threshold_scale` / `--cfar-scale` 语义已经删除，不再使用
+
+这样做是为了避免“配置里看起来可调、实际算法里不生效”的语义断裂。
+
+## 10. 输出文件
+
+### 10.1 检测点 CSV
+
+`raw_packet_replay` 默认输出：
+
+- `raw_packet_det.csv`
+
+也可通过 `--det-csv PATH` 指定文件名。
+
+字段包括：
+
+- `det_uid`
+- `frame_idx`
+- `frame_id`
+- `det_idx`
+- `beam_az_raw`
+- `beam_el_raw`
+- `beam_az_deg`
+- `beam_el_deg`
+- `rel_az_deg`
+- `rel_el_deg`
+- `abs_az_deg`
+- `abs_el_deg`
+- `valid_az`
+- `valid_el`
 - `rbin`
-- `dbin_c`（中心化 Doppler bin）
-- `dbin_u`（未中心化 Doppler bin）
+- `dbin_c`
+- `dbin_u`
 - `range_m`
 - `vel_mps`
 - `snr_db`
-- `az_deg`
-- `el_deg`
-- `az_err`（比幅测角原始误差，范围通常在 `[-1, 1]`）
-- `el_err`（比幅测角原始误差，范围通常在 `[-1, 1]`）
 - `power`
+- `az_err`
+- `el_err`
 
-### 5.2 RD 功率图导出（调试）
+说明：
 
-调试时可能输出 `power_map_frame_XXX.bin`，用于离线比对。
+- 这是当前最推荐的离线分析输出
+- 更适合 Matlab / 上位机做散点图、轨迹趋势观察和跨波位分析
 
-## 6. Track 字段含义
+### 10.2 轨迹 CSV
 
-说明：当前工程测角方法为**比幅测角法**（Amplitude Comparison），
-通过 `sum/diff` 重建左右波束幅度并计算幅度比，再通过标定曲线映射到角度。
+`radar_app` 默认输出：
 
-日志示例：
+- `offline_multi_track.csv`
 
-```text
-[Track] id=98 conf=1 age=18 hits=18 miss=0 rbin=24 dbin_c=-15 range=3.6 m vel=-3.0 m/s snr=27.54 dB
-```
+`raw_packet_replay` 默认输出：
 
-含义：
+- `raw_packet_track.csv`
 
-- `id`：轨迹编号
-- `conf`：是否已确认轨迹
-- `age`：轨迹已存在帧数
-- `hits`：累计命中次数
-- `miss`：连续丢失次数
-- `range/vel`：滤波后的轨迹状态
+也可通过 `--track-csv PATH` 指定文件名。
 
-## 7. 关键参数
+说明：
 
-参数定义在 `model/RadarConfig.h`，默认 profile 在 `app/main.cpp` 设置。
+- 当前 tracker 仍可用于参考
+- 但在按波位抽帧分析时，track 不一定稳定
+- 现阶段更建议优先看 detection CSV
 
-### 7.1 检测与后处理
+### 10.3 功率图 dump
 
-- `cfar_peak_min_snr_db`
-- `cfar_peak_half_window`
-- `post_min_snr_db`
-- `post_top_k`
-- `dbscan_*`
-- `post_doppler_line_suppress_enable`
-- `post_doppler_line_min_points`
-- `post_doppler_line_keep_per_bin`
+启用 `--dump-power-map` 后，会在仓库根目录生成：
 
-### 7.2 追踪
+- `power_map_frame_000.bin`
+- `power_map_frame_001.bin`
+- `...`
 
-- `tracking_gate_range_m`
-- `tracking_gate_velocity_mps`
-- `tracking_confirm_hits`
-- `tracking_max_missed_frames`
-- `tracking_spawn_min_snr_db`
-- `tracking_spawn_exclusion_range_m`
-- `tracking_spawn_exclusion_velocity_mps`
-- `tracking_output_only_updated_tracks`
-- `tracking_output_min_age`
-- `tracking_output_min_hits`
+它们可被 Matlab 脚本直接读取。
 
-若要抑制短命假轨迹，可调大：
+## 11. MATLAB 脚本
 
-- `tracking_output_min_age`
-- `tracking_output_min_hits`
+当前常用脚本包括：
 
-## 8. MATLAB 轨迹可视化
-
-脚本：
-
+- `matlab/inspect_dumped_power_map.m`
+- `matlab/compare_raw_packet_power_map.m`
+- `matlab/plot_detection_csv.m`
+- `matlab/inspect_detection_frame.m`
 - `matlab/plot_multi_track.m`
+- `matlab/plot_primary_track.m`
+- `matlab/rd_quicklook.m`
 - `matlab/fit_angle_calibration.m`
 
-运行方式：
+推荐看法：
 
-```matlab
-cd('/home/whj/cuda_workplace/radar_app/matlab');
-plot_multi_track;
-```
+1. 先用 `compare_raw_packet_power_map.m` 对齐 GPU 与 Matlab 功率图
+2. 再用 `plot_detection_csv.m` 看检测点整体分布
+3. 对异常帧用 `inspect_detection_frame.m` 单帧展开
 
-脚本功能：
+更详细的 Matlab 说明见：
 
-- 读取 `offline_multi_track.csv`
-- 保留 confirmed 轨迹
-- 用 `min_track_rows`（默认 `6`）过滤短轨迹
-- 绘制：
-  - frame-range
-  - frame-velocity
-  - frame-SNR
-  - range-velocity 相图
-  - bin 域总览（`rbin`、`dbin_c`）
+- [matlab/README.md](/home/whj/cuda_workplace/radar_app/matlab/README.md)
 
-### 8.1 角度标定脚本（比幅）
+## 12. 常见日志
 
-运行方式：
+常见日志项包括：
 
-```matlab
-cd('/home/whj/cuda_workplace/radar_app/matlab');
-fit_angle_calibration;
-```
+- `[Power] min=... max=... mean=... max_bin=(d,r)`
+- `[CFAR] hits=... peaks=...`
+- `[DBSCAN] in=... clusters=... out=...`
+- `[DOPPLER] in=... suppressed_bins=... out=...`
+- `[Raw Frame k] frame_id=... det=... tracks=... beam=(az,el)`
+- `[Offline Frame k] detections=n tracks=m`
 
-输入：
+说明：
 
-- `offline_multi_track.csv`（来自离线回放）
-- `angle_truth.csv`（实测真值，字段必须包含）
-  - `frame`
-  - `track_id`
-  - `az_truth_deg`
-  - `el_truth_deg`
+- `hits`：CFAR 过门限单元数
+- `peaks`：NMS 后峰值数
+- `det`：主机侧后处理后的最终检测点数
+- `tracks`：当前帧输出的轨迹数
 
-输出：
+## 13. 当前工程状态建议
 
-- `angle_calib_lut.csv`（可用于生成 LUT）
-- `angle_calib_result.mat`（包含线性拟合参数和 LUT）
+当前更推荐的分析方式是：
 
-若未提供 `angle_truth.csv`，脚本会自动生成 `angle_truth_template.csv`，填完真值后重命名再运行。
+1. 先把所有检测点保存到 `det csv`
+2. 在 Matlab 或上位机上看全量检测点分布
+3. 再决定是否需要跟踪
 
-## 9. 常见问题
+原因：
 
-### 9.1 `CUDA error: OS call failed or operation not supported on this OS`
+- 检测点更直接反映 RD / CFAR / 测角是否正常
+- 轨迹会叠加额外的时间基准、门控和确认策略
+- 在波位扫描、抽帧分析场景下，track 可能不稳定
 
-通常表示当前环境无法访问 GPU（常见于 WSL/容器配置问题）。
+## 14. 常见问题
 
-先检查：
+### 14.1 `CUDA driver version is insufficient for CUDA runtime version`
+
+说明当前环境 CUDA 驱动与运行时不匹配。先检查：
 
 ```bash
 nvidia-smi
 ```
 
-### 9.2 目标/轨迹数量过多
+### 14.2 原始抓包接入后完全不出点
 
-可尝试：
+建议依次检查：
 
-- 调高 `cfar_peak_min_snr_db`
-- 调高 `post_min_snr_db`
-- 调高 `dbscan_min_points`
-- 开启并收紧 Doppler 线抑制
-- 调高 `tracking_output_min_hits` / `tracking_output_min_age`
+- `compare_raw_packet_power_map.m` 是否与 GPU dump 对齐
+- `--profile multi` 是否已经使用
+- `--cfar-peak-snr-db` 和 `--post-min-snr-db` 是否过高
 
-### 9.3 轨迹容易断
+### 14.3 某一帧检测点突然很多
 
-可尝试：
+建议：
 
-- 降低 `tracking_confirm_hits`
-- 增大 `tracking_max_missed_frames`
-- 略微放宽 `tracking_gate_*`
+- 用 `inspect_detection_frame.m` 单独展开该帧
+- 先确认是 RD 图本身异常，还是 CFAR / 峰值提取过宽
 
-## 10. Git 工作流
-
-当前多目标开发分支：
-
-- `feature/multi-target-tracking`
-
-常用命令：
-
-```bash
-git status
-git add .
-git commit -m "feat: multi-target tracking pipeline and tuning profiles"
-git push -u origin feature/multi-target-tracking
-```

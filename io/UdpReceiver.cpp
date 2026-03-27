@@ -1,4 +1,5 @@
 #include "io/UdpReceiver.h"
+#include "io/FrameRuntimeConfigBuilder.h"
 #include <chrono>
 #include <arpa/inet.h>
 #include <cstring>
@@ -89,6 +90,9 @@ namespace radar
             if (st.frame_completed)
             {
                 slots_[*filling_slot].frame_id = assembler.current_frame_id();
+                slots_[*filling_slot].runtime =
+                    build_frame_runtime_config(assembler.current_frame_id(),
+                                               assembler.current_frame_header());
                 ring_.mark_ready(*filling_slot);
                 metrics_.frames_completed.fetch_add(1, std::memory_order_relaxed);
                 auto next = ring_.acquire_free_slot();

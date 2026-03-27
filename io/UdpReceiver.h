@@ -7,6 +7,7 @@
 
 #include "io/FrameAssembler.h"
 #include "io/RingBuffer.h"
+#include "model/FrameMetadata.h"
 #include "model/RadarConfig.h"
 #include "runtime/Logger.h"
 #include "runtime/Metrics.h"
@@ -18,6 +19,7 @@ namespace radar
         uint8_t *mapped_host = nullptr;
         int16_t *mapped_dev = nullptr;
         uint32_t frame_id = 0;
+        FrameRuntimeConfig runtime{};
     };
     template <std::size_t N>
     class UdpReceiver

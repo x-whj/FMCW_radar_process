@@ -5,6 +5,24 @@
 namespace radar
 {
 
+    __global__ void zero_doppler_notch_kernel(
+        float *__restrict__ power_map,
+        int width,
+        int height,
+        int notch_bins)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = width * height;
+        if (idx >= total)
+            return;
+
+        const int y = idx / width;
+        if (y < notch_bins || y >= height - notch_bins)
+        {
+            power_map[idx] = 0.0f;
+        }
+    }
+
     __global__ void sum_channel_power_kernel_scalar(
         const float2 *__restrict__ cube,
         float *__restrict__ power_map,
@@ -70,6 +88,31 @@ namespace radar
         const int blocks = (elements_per_channel + threads - 1) / threads;
         sum_channel_power_kernel_scalar<<<blocks, threads, 0, stream>>>(
             cube, power_map, sum_channel, elements_per_channel);
+    }
+
+    void launch_zero_doppler_notch(
+        cudaStream_t stream,
+        float *power_map,
+        int width,
+        int height,
+        int notch_bins)
+    {
+        if (power_map == nullptr || width <= 0 || height <= 0 || notch_bins <= 0)
+        {
+            return;
+        }
+
+        const int clamped_bins = min(notch_bins, height / 2);
+        if (clamped_bins <= 0)
+        {
+            return;
+        }
+
+        constexpr int threads = 256;
+        const int total = width * height;
+        const int blocks = (total + threads - 1) / threads;
+        zero_doppler_notch_kernel<<<blocks, threads, 0, stream>>>(
+            power_map, width, height, clamped_bins);
     }
 
 } // namespace radar

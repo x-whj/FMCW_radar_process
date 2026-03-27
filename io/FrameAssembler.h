@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 
+#include "io/PrtProtocol.h"
 #include "model/RadarConfig.h"
 
 namespace radar
@@ -50,7 +51,7 @@ namespace radar
                 if (!prt_header_parsed_)
                 {
                     // 把 UDP payload 视为连续字节流，
-                    // 在这段字节流里查找下一个合法的 PRT 帧头。
+                    // 在这段字节流里查找下一个合法的PRT帧头。
                     resync_to_prt_head();
                     if (prt_buffer_.size() < RadarConfig::kPrtHeaderBytes)
                     {
@@ -94,26 +95,12 @@ namespace radar
             return last_completed_frame_id_;
         }
 
-    private:
-        struct PendingPrtHeader
+        const PrtHeaderInfo &current_frame_header() const
         {
-            uint32_t global_prt_count = 0;
-            uint16_t prt_num = 0;
-            uint16_t prt_samples = 0;
-            uint16_t frame_length_bytes = 0;
-            uint16_t radar_mode = 0;
-            uint16_t data_type = 0;
-            uint16_t data_format_bits = 0;
-        };
-
-        static uint32_t read_le_u32(const uint8_t *p)
-        {
-            return static_cast<uint32_t>(p[0]) |
-                   (static_cast<uint32_t>(p[1]) << 8) |
-                   (static_cast<uint32_t>(p[2]) << 16) |
-                   (static_cast<uint32_t>(p[3]) << 24);
+            return last_completed_cpi_header_;
         }
 
+    private:
         static std::size_t round_up(std::size_t value, std::size_t align)
         {
             if (align == 0)
@@ -137,87 +124,67 @@ namespace radar
             cpi_started_ = false;
             assembling_frame_id_ = 0;
             received_prts_ = 0;
+            assembling_cpi_header_ = {};
             std::fill(cpi_bitmap_.begin(), cpi_bitmap_.end(), uint8_t{0});
         }
 
-        void start_new_cpi(uint32_t frame_id)
+        void start_new_cpi(uint32_t frame_id, const PrtHeaderInfo &header)
         {
             reset_cpi_state();
             cpi_started_ = true;
             assembling_frame_id_ = frame_id;
+            // 每个 CPI 只锁存一次首个 PRT 头，
+            // 后续算法若需要用雷达角度、CFAR 门限等元数据，
+            // 就从这一份 CPI 级别的头信息里取。
+            assembling_cpi_header_ = header;
         }
 
         void resync_to_prt_head()
         {
-            static constexpr uint8_t kPrtHeadLE[4] = {0x32, 0xCD, 0x55, 0xAA};
-
-            auto it = std::search(prt_buffer_.begin(),
-                                  prt_buffer_.end(),
-                                  std::begin(kPrtHeadLE),
-                                  std::end(kPrtHeadLE));
-
-            if (it == prt_buffer_.end())
-            {
-                if (prt_buffer_.size() > 3)
-                {
-                    prt_buffer_.erase(prt_buffer_.begin(),
-                                      prt_buffer_.end() - 3);
-                }
-                return;
-            }
-
-            if (it != prt_buffer_.begin())
-            {
-                prt_buffer_.erase(prt_buffer_.begin(), it);
-            }
+            radar::resync_to_prt_head(prt_buffer_);
         }
 
         bool parse_prt_header()
         {
             const uint8_t *hdr = prt_buffer_.data();
-            if (read_le_u32(hdr) != RadarConfig::kPrtFixedHeader)
+            pending_prt_ = decode_prt_header(hdr);
+            if (!pending_prt_.has_fixed_head())
             {
                 return false;
             }
 
-            pending_prt_.global_prt_count = read_le_u32(hdr + 8);
+            const uint16_t prt_samples = pending_prt_.prt_samples();
+            const uint16_t frame_length_bytes = pending_prt_.frame_length_bytes();
+            const uint16_t data_format_bits = pending_prt_.data_format_bits();
+            const uint16_t prt_num = pending_prt_.prt_num();
 
-            const uint32_t prt_info = read_le_u32(hdr + 12);
-            pending_prt_.prt_num = static_cast<uint16_t>(prt_info >> 16);
-            pending_prt_.prt_samples = static_cast<uint16_t>(prt_info & 0xFFFFu);
-
-            const uint32_t frame_info = read_le_u32(hdr + 16);
-            pending_prt_.frame_length_bytes = static_cast<uint16_t>(frame_info >> 16);
-            pending_prt_.radar_mode = static_cast<uint16_t>(frame_info & 0xFFFFu);
-
-            const uint32_t data_info = read_le_u32(hdr + 20);
-            pending_prt_.data_type = static_cast<uint16_t>(data_info >> 16);
-            pending_prt_.data_format_bits = static_cast<uint16_t>(data_info & 0xFFFFu);
-
-            // 当前只接受和现有处理链一致的协议子集：
-            // 固定采样点数、int16 复数 IQ 数据。
-            if (pending_prt_.prt_samples != static_cast<uint16_t>(cfg_.num_samples))
+            // 实际流里有些头字段会保留为 0，此时回退到本地配置。
+            if (prt_samples != 0 && prt_samples != static_cast<uint16_t>(cfg_.num_samples))
             {
                 return false;
             }
 
-            if (pending_prt_.frame_length_bytes != static_cast<uint16_t>(cfg_.prt_data_bytes()))
+            if (frame_length_bytes != 0 && frame_length_bytes != static_cast<uint16_t>(cfg_.prt_data_bytes()))
             {
                 return false;
             }
 
-            if (pending_prt_.data_format_bits != 16)
+            if (data_format_bits != 0 && data_format_bits != 16)
             {
                 return false;
             }
 
-            if (pending_prt_.prt_num >= static_cast<uint16_t>(cfg_.num_chirps))
+            if (!cfg_.protocol_prt_num_in_range(static_cast<int>(prt_num)))
             {
                 return false;
             }
+
+            const std::size_t effective_frame_length =
+                frame_length_bytes != 0 ? static_cast<std::size_t>(frame_length_bytes)
+                                        : cfg_.prt_data_bytes();
 
             prt_total_bytes_ = RadarConfig::kPrtHeaderBytes +
-                               static_cast<std::size_t>(pending_prt_.frame_length_bytes);
+                               effective_frame_length;
             prt_padded_bytes_ = round_up(prt_total_bytes_,
                                          static_cast<std::size_t>(std::max(cfg_.udp_payload_bytes, 0)));
             prt_header_parsed_ = true;
@@ -238,21 +205,31 @@ namespace radar
 
             if (!cpi_started_)
             {
-                if (pending_prt_.prt_num != 0)
+                if (pending_prt_.prt_num() != static_cast<uint16_t>(cfg_.active_prt_first_num()))
                 {
                     return st;
                 }
 
-                start_new_cpi(pending_prt_.global_prt_count);
+                start_new_cpi(pending_prt_.global_prt_count(), pending_prt_);
                 st.started_new_frame = true;
             }
-            else if (pending_prt_.prt_num == 0)
+            //宁愿丢掉后续的 PRT 也不接受乱序的 PRT，因为乱序可能是因为 UDP 丢包导致的，接受乱序反而会把错误数据组装成完整帧输出。
+            else if (pending_prt_.prt_num() == static_cast<uint16_t>(cfg_.active_prt_first_num()))
             {
-                start_new_cpi(pending_prt_.global_prt_count);
+                start_new_cpi(pending_prt_.global_prt_count(), pending_prt_);
                 st.started_new_frame = true;
             }
 
-            const std::size_t prt_idx = static_cast<std::size_t>(pending_prt_.prt_num);
+            const int prt_num = static_cast<int>(pending_prt_.prt_num());
+
+            if (!cfg_.active_prt_num_in_range(prt_num))
+            {
+                // 实际协议里尾部若干 PRT 用于切波位，不参与当前 CPI 的算法处理。
+                return st;
+            }
+
+            const std::size_t prt_idx =
+                static_cast<std::size_t>(prt_num - cfg_.active_prt_first_num());
             if (prt_idx >= cpi_bitmap_.size())
             {
                 st.packet_invalid = true;
@@ -285,6 +262,7 @@ namespace radar
             if (received_prts_ == static_cast<std::size_t>(cfg_.num_chirps))
             {
                 last_completed_frame_id_ = assembling_frame_id_;
+                last_completed_cpi_header_ = assembling_cpi_header_;
                 reset_cpi_state();
                 st.frame_completed = true;
             }
@@ -299,13 +277,15 @@ namespace radar
         bool prt_header_parsed_ = false;
         std::size_t prt_total_bytes_ = 0;
         std::size_t prt_padded_bytes_ = 0;
-        PendingPrtHeader pending_prt_{};
+        PrtHeaderInfo pending_prt_{};
 
         std::vector<uint8_t> cpi_bitmap_;
         bool cpi_started_ = false;
         uint32_t assembling_frame_id_ = 0;
         uint32_t last_completed_frame_id_ = 0;
         std::size_t received_prts_ = 0;
+        PrtHeaderInfo assembling_cpi_header_{};
+        PrtHeaderInfo last_completed_cpi_header_{};
     };
 
 } // namespace radar

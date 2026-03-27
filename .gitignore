@@ -9,6 +9,9 @@
 
 # Generated runtime outputs
 /offline_primary_track.csv
+/offline_multi_track.csv
+/raw_packet_*.csv
+/zero_beam_*.csv
 /output_*.dat
 /power_map_frame_*.bin
 /run.log
